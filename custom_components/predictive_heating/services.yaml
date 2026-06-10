@@ -1,0 +1,70 @@
+train_now:
+  name: Train now
+  description: >-
+    Bootstrap (or refresh) the thermal model for one or all zones from recorder
+    history.
+  fields:
+    zone_id:
+      name: Zone ID
+      description: Optional. Limit training to a single zone.
+      required: false
+      selector:
+        text:
+    days:
+      name: History days
+      description: How many days of history to learn from.
+      required: false
+      default: 7
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: days
+
+reset_model:
+  name: Reset model
+  description: Discard the learned thermal model for one or all zones.
+  fields:
+    zone_id:
+      name: Zone ID
+      description: Optional. Limit reset to a single zone.
+      required: false
+      selector:
+        text:
+
+set_comfort_profile:
+  name: Set comfort profile
+  description: Update the comfort band / target for a zone at runtime.
+  fields:
+    zone_id:
+      name: Zone ID
+      required: true
+      selector:
+        text:
+    comfort_min:
+      name: Comfort minimum
+      required: false
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+    comfort_target:
+      name: Comfort target
+      required: false
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+    comfort_max:
+      name: Comfort maximum
+      required: false
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"

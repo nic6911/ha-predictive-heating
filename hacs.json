@@ -1,0 +1,5 @@
+{
+  "name": "Predictive Floor Heating (HeatPilot)",
+  "render_readme": true,
+  "homeassistant": "2024.4.0"
+}

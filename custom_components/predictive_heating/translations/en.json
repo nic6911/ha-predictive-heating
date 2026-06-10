@@ -1,0 +1,113 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Predictive Floor Heating",
+        "description": "Select the weather entity for your location and the global optimization settings. You can add rooms/zones afterwards from the integration options.",
+        "data": {
+          "weather_entity": "Weather entity",
+          "price_entity": "Energy price sensor (optional)",
+          "co2_entity": "CO2 intensity sensor (optional)",
+          "price_optimize": "Enable price-aware scheduling",
+          "mode": "Optimization profile",
+          "horizon_hours": "Prediction horizon (hours)",
+          "step_minutes": "Control step (minutes)",
+          "update_interval_minutes": "Update interval (minutes)"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Predictive Floor Heating is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Predictive Floor Heating",
+        "menu_options": {
+          "global": "Global settings",
+          "add_zone": "Add zone",
+          "remove_zone": "Remove zones"
+        }
+      },
+      "global": {
+        "title": "Global settings",
+        "data": {
+          "weather_entity": "Weather entity",
+          "price_entity": "Energy price sensor (optional)",
+          "co2_entity": "CO2 intensity sensor (optional)",
+          "price_optimize": "Enable price-aware scheduling",
+          "mode": "Optimization profile",
+          "horizon_hours": "Prediction horizon (hours)",
+          "step_minutes": "Control step (minutes)",
+          "update_interval_minutes": "Update interval (minutes)"
+        }
+      },
+      "add_zone": {
+        "title": "Add a zone",
+        "data": {
+          "climate_entity": "Thermostat (climate) entity",
+          "name": "Zone name",
+          "temp_sensor": "Temperature feedback sensor (optional)",
+          "outdoor_sensor": "Outdoor temperature sensor (optional)",
+          "irradiance_sensor": "Solar irradiance sensor (optional)",
+          "comfort_min": "Comfort minimum (°C)",
+          "comfort_target": "Comfort target (°C)",
+          "comfort_max": "Comfort maximum (°C)",
+          "zone_mode": "Control mode",
+          "enabled": "Enabled"
+        }
+      },
+      "remove_zone": {
+        "title": "Remove zones",
+        "data": {
+          "zones": "Zones to keep"
+        }
+      }
+    },
+    "abort": {
+      "max_zones_reached": "Maximum number of zones (16) reached.",
+      "no_zones": "No zones are configured yet."
+    }
+  },
+  "selector": {
+    "mode": {
+      "options": {
+        "comfort": "Comfort",
+        "balanced": "Balanced",
+        "eco": "Eco",
+        "price": "Price"
+      }
+    },
+    "zone_mode": {
+      "options": {
+        "auto": "Autonomous",
+        "advisory": "Advisory only"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "recommended_setpoint": { "name": "Recommended setpoint" },
+      "predicted_temperature": { "name": "Predicted temperature" },
+      "estimated_savings": { "name": "Estimated setpoint reduction" },
+      "fit_rmse": { "name": "Model fit RMSE" }
+    },
+    "binary_sensor": {
+      "manual_override": { "name": "Manual override" },
+      "free_heat": { "name": "Coasting on free heat" }
+    },
+    "switch": {
+      "master_enable": { "name": "Predictive control" },
+      "zone_enable": { "name": "Predictive control" }
+    },
+    "number": {
+      "comfort_min": { "name": "Comfort minimum" },
+      "comfort_target": { "name": "Comfort target" },
+      "comfort_max": { "name": "Comfort maximum" }
+    },
+    "select": {
+      "mode": { "name": "Optimization profile" }
+    }
+  }
+}

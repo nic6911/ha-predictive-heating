@@ -1,0 +1,5 @@
+numpy>=1.21.0
+homeassistant
+pytest-homeassistant-custom-component
+pytest
+pytest-asyncio

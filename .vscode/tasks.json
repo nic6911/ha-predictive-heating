@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Home Assistant",
+      "type": "shell",
+      "command": "mkdir -p config && hass -c config",
+      "problemMatcher": [],
+      "detail": "Start a dev Home Assistant instance with this integration available via symlink."
+    },
+    {
+      "label": "Link integration into config",
+      "type": "shell",
+      "command": "mkdir -p config/custom_components && ln -sf $(pwd)/custom_components/predictive_heating config/custom_components/predictive_heating",
+      "problemMatcher": []
+    },
+    {
+      "label": "Run tests",
+      "type": "shell",
+      "command": "pytest -q",
+      "problemMatcher": []
+    }
+  ]
+}
