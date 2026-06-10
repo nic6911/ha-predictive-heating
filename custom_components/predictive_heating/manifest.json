@@ -1,13 +1,13 @@
 {
   "domain": "predictive_heating",
   "name": "Predictive Floor Heating (HeatPilot)",
-  "codeowners": ["@yourname"],
+  "codeowners": ["@nic6911"],
   "config_flow": true,
   "dependencies": ["recorder"],
   "after_dependencies": ["weather", "sun"],
-  "documentation": "https://github.com/yourname/ha-predictive-heating",
+  "documentation": "https://github.com/nic6911/ha-predictive-heating",
   "iot_class": "calculated",
-  "issue_tracker": "https://github.com/yourname/ha-predictive-heating/issues",
+  "issue_tracker": "https://github.com/nic6911/ha-predictive-heating/issues",
   "requirements": ["numpy>=1.21.0"],
   "version": "0.1.0"
 }
