@@ -202,7 +202,10 @@ class PredictiveHeatingOptionsFlow(OptionsFlow):
     """Manage global settings and zones after setup."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
-        self.config_entry = config_entry
+        # NB: never assign ``self.config_entry`` -- it is a reserved property on
+        # OptionsFlow whose explicit setter is deprecated and removed in newer HA
+        # (raises -> 500 when opening the options dialog). Use our own attribute.
+        self._entry = config_entry
         self._options = dict(config_entry.options)
         self._options.setdefault(CONF_ZONES, list(config_entry.options.get(CONF_ZONES, [])))
 
@@ -214,10 +217,10 @@ class PredictiveHeatingOptionsFlow(OptionsFlow):
 
     async def async_step_global(self, user_input: dict[str, Any] | None = None) -> Any:
         if user_input is not None:
-            merged = {**self.config_entry.data, **self._options, **user_input}
+            merged = {**self._entry.data, **self._options, **user_input}
             merged[CONF_ZONES] = self._options.get(CONF_ZONES, [])
             return self.async_create_entry(title="", data=merged)
-        defaults = {**self.config_entry.data, **self._options}
+        defaults = {**self._entry.data, **self._options}
         return self.async_show_form(
             step_id="global", data_schema=_global_schema(defaults)
         )
@@ -235,7 +238,7 @@ class PredictiveHeatingOptionsFlow(OptionsFlow):
             zones = [z for z in zones if z.get(CONF_ZONE_ID) != zone[CONF_ZONE_ID]]
             zones.append(zone)
             self._options[CONF_ZONES] = zones
-            merged = {**self.config_entry.data, **self._options}
+            merged = {**self._entry.data, **self._options}
             return self.async_create_entry(title="", data=merged)
         return self.async_show_form(
             step_id="add_zone", data_schema=_zone_schema({})
@@ -252,7 +255,7 @@ class PredictiveHeatingOptionsFlow(OptionsFlow):
             self._options[CONF_ZONES] = [
                 z for z in zones if z[CONF_ZONE_ID] in keep
             ]
-            merged = {**self.config_entry.data, **self._options}
+            merged = {**self._entry.data, **self._options}
             return self.async_create_entry(title="", data=merged)
         options = [
             selector.SelectOptionDict(value=z[CONF_ZONE_ID], label=z.get("name", z[CONF_ZONE_ID]))

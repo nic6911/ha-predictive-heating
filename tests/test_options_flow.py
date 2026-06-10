@@ -1,5 +1,7 @@
 """Reproduce the options flow: open the menu and add a zone."""
 
+from pathlib import Path
+
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from homeassistant.core import HomeAssistant
@@ -59,3 +61,18 @@ async def test_options_menu_and_add_zone(
     zones = result["data"][CONF_ZONES]
     assert len(zones) == 1
     assert zones[0][CONF_CLIMATE_ENTITY] == "climate.stue_ka"
+
+
+def test_options_flow_never_sets_reserved_config_entry():
+    """Guard: assigning ``self.config_entry`` in an OptionsFlow hits a deprecated
+    setter that breaks in newer HA (-> 500 when opening the dialog). We must use a
+    private attribute instead."""
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "custom_components"
+        / "predictive_heating"
+        / "config_flow.py"
+    ).read_text(encoding="utf-8")
+    assert "self.config_entry =" not in src, (
+        "Do not assign self.config_entry in OptionsFlow; use self._entry instead."
+    )
