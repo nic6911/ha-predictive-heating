@@ -91,6 +91,11 @@ class ZoneResult:
     advisory: bool = False
     fit_rmse: float | None = None
     estimated_savings: float | None = None
+    # Predicted indoor-temperature trajectory over the MPC horizon, as a list of
+    # {"datetime", "predicted", "free_float", "outdoor"} points (step 1..n).
+    forecast: list[dict] = field(default_factory=list)
+    horizon_hours: float | None = None
+    step_minutes: int | None = None
 
 
 @dataclass
@@ -328,6 +333,24 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             float(plan.temperature[0]) if len(plan.temperature) else None
         )
         result.has_authority = plan.has_authority
+
+        # Publish the full predicted trajectory so it can be graphed over the horizon.
+        step_min = int(self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES))
+        now = dt_util.utcnow()
+        forecast: list[dict] = []
+        for k in range(len(plan.temperature)):
+            point = {
+                "datetime": (now + timedelta(minutes=step_min * (k + 1))).isoformat(),
+                "predicted": round(float(plan.temperature[k]), 2),
+            }
+            if k < len(plan.free_float):
+                point["free_float"] = round(float(plan.free_float[k]), 2)
+            if k < len(t_out_fc):
+                point["outdoor"] = round(float(t_out_fc[k]), 2)
+            forecast.append(point)
+        result.forecast = forecast
+        result.horizon_hours = self._global(CONF_HORIZON_HOURS, DEFAULT_HORIZON_HOURS)
+        result.step_minutes = step_min
 
         # Estimated savings proxy: heat avoided versus holding the comfort target.
         baseline_u = max(0.0, comfort_target - indoor)

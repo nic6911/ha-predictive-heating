@@ -26,6 +26,7 @@ class ZoneSensorDescription(SensorEntityDescription):
     """Describes a per-zone sensor."""
 
     value_fn: Callable[[ZoneResult], float | None]
+    attr_fn: Callable[[ZoneResult], dict] | None = None
 
 
 SENSORS: tuple[ZoneSensorDescription, ...] = (
@@ -44,6 +45,11 @@ SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda z: z.predicted_temperature,
+        attr_fn=lambda z: {
+            "horizon_hours": z.horizon_hours,
+            "step_minutes": z.step_minutes,
+            "forecast": z.forecast,
+        },
     ),
     ZoneSensorDescription(
         key="estimated_savings",
@@ -95,3 +101,10 @@ class ZoneSensor(PredictiveZoneEntity, SensorEntity):
         if zone is None:
             return None
         return self.entity_description.value_fn(zone)
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        zone = self.zone
+        if zone is None or self.entity_description.attr_fn is None:
+            return None
+        return self.entity_description.attr_fn(zone)

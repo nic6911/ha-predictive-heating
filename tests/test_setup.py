@@ -79,6 +79,16 @@ async def test_setup_entry_runs_cycle(
     buttons = hass.states.async_all("button")
     assert any("train" in s.entity_id for s in buttons), "train button not created"
 
+    # The predicted-temperature sensor should publish the full horizon trajectory.
+    assert result.forecast, "no predicted trajectory published"
+    assert len(result.forecast) == coordinator.horizon_steps
+    first = result.forecast[0]
+    assert "datetime" in first and "predicted" in first
+    pred_sensor = next(
+        s for s in hass.states.async_all("sensor") if "predicted" in s.entity_id
+    )
+    assert pred_sensor.attributes.get("forecast"), "forecast attribute missing"
+
 
 async def test_disabled_zone_still_predicts(
     recorder_mock, enable_custom_integrations, hass: HomeAssistant
