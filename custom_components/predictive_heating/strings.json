@@ -24,9 +24,10 @@
     "step": {
       "init": {
         "title": "Predictive Floor Heating",
+        "description": "Choose 'Add zone' to register each room/thermostat you want to control (repeat once per room, up to 16). 'Global settings' edits the weather/price options. 'Remove zones' deletes zones.",
         "menu_options": {
           "global": "Global settings",
-          "add_zone": "Add zone",
+          "add_zone": "Add zone (register a room/thermostat)",
           "remove_zone": "Remove zones"
         }
       },
