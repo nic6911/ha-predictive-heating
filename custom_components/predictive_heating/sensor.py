@@ -48,14 +48,14 @@ SENSORS: tuple[ZoneSensorDescription, ...] = (
     ZoneSensorDescription(
         key="estimated_savings",
         translation_key="estimated_savings",
-        native_unit_of_measurement=UnitOfTemperature.KELVIN,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda z: z.estimated_savings,
     ),
     ZoneSensorDescription(
         key="fit_rmse",
         translation_key="fit_rmse",
-        native_unit_of_measurement=UnitOfTemperature.KELVIN,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z: z.fit_rmse,
     ),

@@ -289,7 +289,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         model = core.rls.to_model(step_minutes=self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES))
         result.fit_rmse = model.rmse
 
-        if not enabled or indoor is None or len(t_out_fc) == 0:
+        # We still compute predictions/recommendations when the zone is disabled
+        # so the sensors stay meaningful; we simply never write the setpoint then
+        # (handled by the advisory guardrail below).
+        if indoor is None or len(t_out_fc) == 0:
             return result
 
         comfort_target = float(
@@ -338,7 +341,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         zone_mode = cfg.get(CONF_ZONE_MODE)
         fit_ok = model.rmse is not None and model.rmse <= FIT_RMSE_AUTONOMY_THRESHOLD
         advisory = (
-            zone_mode == ZONE_MODE_ADVISORY
+            not enabled
+            or zone_mode == ZONE_MODE_ADVISORY
             or manual
             or not fit_ok
             or not self._master_enabled()

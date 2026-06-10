@@ -95,11 +95,11 @@
       "fit_rmse": { "name": "Model fit RMSE" }
     },
     "binary_sensor": {
-      "manual_override": { "name": "Manual override" },
+      "manual_override": { "name": "Manual override active" },
       "free_heat": { "name": "Coasting on free heat" }
     },
     "switch": {
-      "master_enable": { "name": "Predictive control" },
+      "master_enable": { "name": "Autonomous control (master)" },
       "zone_enable": { "name": "Predictive control" }
     },
     "number": {
@@ -109,6 +109,11 @@
     },
     "select": {
       "mode": { "name": "Optimization profile" }
+    },
+    "button": {
+      "train_all": { "name": "Train all zones now" },
+      "train_zone": { "name": "Train from history" },
+      "reset_zone": { "name": "Reset learned model" }
     }
   }
 }

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 DOMAIN = "predictive_heating"
-PLATFORMS = ["sensor", "binary_sensor", "switch", "number", "select"]
+PLATFORMS = ["sensor", "binary_sensor", "switch", "number", "select", "button"]
 
 # Limits
 MAX_ZONES = 16
