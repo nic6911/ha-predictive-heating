@@ -21,10 +21,26 @@ from homeassistant.util import dt as dt_util
 from .const import (
     MANUAL_OVERRIDE_HOLD,
     MANUAL_OVERRIDE_TOLERANCE,
+    PLAUSIBLE_TEMP_MAX,
+    PLAUSIBLE_TEMP_MIN,
     SETPOINT_DEADBAND,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _plausible(value: float | None) -> float | None:
+    """Return the value if it is a physically plausible temperature, else None.
+
+    Filters out sensor-fault sentinels (e.g. 327.67 C) so a single bad reading can
+    never enter the learning/control pipeline.
+    """
+    if value is None:
+        return None
+    if value < PLAUSIBLE_TEMP_MIN or value > PLAUSIBLE_TEMP_MAX:
+        _LOGGER.debug("Ignoring implausible temperature reading %.2f", value)
+        return None
+    return value
 
 
 @dataclass
@@ -46,7 +62,7 @@ def read_indoor(hass: HomeAssistant, climate_entity: str, temp_sensor: str | Non
         state = hass.states.get(temp_sensor)
         if state is not None:
             try:
-                return float(state.state)
+                return _plausible(float(state.state))
             except (TypeError, ValueError):
                 pass
     state = hass.states.get(climate_entity)
@@ -54,7 +70,7 @@ def read_indoor(hass: HomeAssistant, climate_entity: str, temp_sensor: str | Non
         return None
     val = state.attributes.get("current_temperature")
     try:
-        return None if val is None else float(val)
+        return None if val is None else _plausible(float(val))
     except (TypeError, ValueError):
         return None
 
@@ -65,7 +81,7 @@ def read_setpoint(hass: HomeAssistant, climate_entity: str) -> float | None:
         return None
     val = state.attributes.get(ATTR_TEMPERATURE)
     try:
-        return None if val is None else float(val)
+        return None if val is None else _plausible(float(val))
     except (TypeError, ValueError):
         return None
 

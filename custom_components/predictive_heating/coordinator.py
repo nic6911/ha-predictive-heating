@@ -53,9 +53,14 @@ from .const import (
     DEFAULT_MODE,
     DEFAULT_STEP_MINUTES,
     DEFAULT_UPDATE_INTERVAL,
+    DISTURBANCE_DROP_MIN,
+    DISTURBANCE_DROP_SIGMA,
+    DISTURBANCE_HOLD,
     DOMAIN,
     FIT_RMSE_AUTONOMY_THRESHOLD,
     MODE_WEIGHTS,
+    OUTLIER_ABS_CAP,
+    OUTLIER_SIGMA,
     ZONE_MODE_ADVISORY,
 )
 from .control import mpc
@@ -91,6 +96,11 @@ class ZoneResult:
     advisory: bool = False
     fit_rmse: float | None = None
     estimated_savings: float | None = None
+    # True while a window/door-type disturbance is active (learning frozen,
+    # last good setpoint held).
+    disturbance: bool = False
+    # Last one-step prediction error (measured now minus previously predicted), deg C.
+    prediction_error: float | None = None
     # Predicted indoor-temperature trajectory over the MPC horizon, as a list of
     # {"datetime", "predicted", "free_float", "outdoor"} points (step 1..n).
     forecast: list[dict] = field(default_factory=list)
@@ -105,8 +115,12 @@ class _ZoneCore:
     config: dict
     rls: RecursiveLeastSquares
     runtime: climate_io.ZoneRuntime
-    last_obs: dict | None = None  # {indoor, t_out, sol, u}
+    last_obs: dict | None = None  # {indoor, t_out, sol, u, predicted}
     extra: dict = field(default_factory=dict)
+    # Disturbance state: timestamp until which learning is frozen and the last good
+    # setpoint is held, plus the setpoint to hold.
+    disturbance_until: object | None = None
+    hold_setpoint: float | None = None
 
 
 class PredictiveHeatingCoordinator(DataUpdateCoordinator):
@@ -151,7 +165,11 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             zone_id = cfg[CONF_ZONE_ID]
             model = self.store.get_model(zone_id)
             params = model.params if model else None
-            rls = RecursiveLeastSquares(params=params)
+            rls = RecursiveLeastSquares(
+                params=params,
+                outlier_sigma=OUTLIER_SIGMA,
+                outlier_abs_cap=OUTLIER_ABS_CAP,
+            )
             self._zones[zone_id] = _ZoneCore(
                 config=cfg,
                 rls=rls,
@@ -265,6 +283,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         )
         current_setpoint = climate_io.read_setpoint(self.hass, climate_entity)
         t_out_now, sol_now = self._current_outdoor_solar(cfg)
+        now = dt_util.utcnow()
 
         result = ZoneResult(
             zone_id=zone_id,
@@ -274,15 +293,51 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             current_setpoint=current_setpoint,
         )
 
-        # 1) Learn from the previous observation.
+        # 1) Learn from the previous observation, with disturbance rejection.
+        #
+        # We work in temperature-difference form: the model predicts the change
+        # ``indoor - prev_indoor`` from the regressor ``[t_out-indoor, sol, u, 1]``.
+        # A window/door disturbance shows up as the room cooling far faster than the
+        # model expects (a large *negative* residual). When that happens we freeze
+        # learning and hold the last good setpoint for a recovery window, so a
+        # transient never corrupts the learned dynamics.
+        in_hold = core.disturbance_until is not None and now < core.disturbance_until
+        disturbance = in_hold
         if core.last_obs is not None and indoor is not None:
             prev = core.last_obs
-            phi = np.array(
-                [prev["indoor"], prev["t_out"], prev["sol"], prev["u"], 1.0]
+            phi_d = np.array(
+                [
+                    prev["t_out"] - prev["indoor"],
+                    prev["sol"],
+                    prev["u"],
+                    1.0,
+                ]
             )
-            core.rls.update(phi, indoor)
+            predicted_delta = core.rls.predict_delta(phi_d)
+            measured_delta = indoor - prev["indoor"]
+            residual = measured_delta - predicted_delta
+            result.prediction_error = round(residual, 3)
 
-        # Record this observation for next cycle's learning.
+            scale = core.rls._scale or 0.0
+            drop_threshold = max(
+                DISTURBANCE_DROP_MIN, DISTURBANCE_DROP_SIGMA * scale
+            )
+            if residual < -drop_threshold:
+                # New (or continuing) disturbance: freeze learning, hold setpoint.
+                disturbance = True
+                core.disturbance_until = now + DISTURBANCE_HOLD
+            elif in_hold and residual > -DISTURBANCE_DROP_MIN:
+                # Temperature has recovered toward the prediction -> release hold.
+                disturbance = False
+                core.disturbance_until = None
+
+            if not disturbance:
+                # Innovation-gated RLS update (also rejects lone outliers internally).
+                core.rls.update(phi_d, measured_delta)
+
+        result.disturbance = disturbance
+
+        # Record this observation for next cycle's learning / detection.
         if indoor is not None and current_setpoint is not None:
             core.last_obs = {
                 "indoor": indoor,
@@ -323,20 +378,34 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             w_energy=w_energy,
         )
 
+        # Honest summer / no-authority behaviour: if the room free-floats above the
+        # comfort ceiling for the whole horizon, the heating has no downward control
+        # authority -- never recommend heating an already-too-warm room.
+        free_float = np.asarray(plan.free_float, dtype=float)
+        summer_no_authority = len(free_float) > 0 and bool(
+            np.all(free_float >= comfort_max)
+        )
+        has_authority = plan.has_authority and not summer_no_authority
+
         # Map the near-term heat demand back to a thermostat setpoint.
         recommended = indoor + plan.u0
         recommended = max(comfort_min, min(comfort_max, recommended))
-        if not plan.has_authority:
+        if not has_authority:
             recommended = comfort_min
+
+        # During an active disturbance (e.g. an open window) freeze control and hold
+        # the last good setpoint rather than chasing the transient.
+        if disturbance and core.hold_setpoint is not None:
+            recommended = core.hold_setpoint
+
         result.recommended_setpoint = climate_io.quantise(recommended, core.runtime)
         result.predicted_temperature = (
             float(plan.temperature[0]) if len(plan.temperature) else None
         )
-        result.has_authority = plan.has_authority
+        result.has_authority = has_authority
 
         # Publish the full predicted trajectory so it can be graphed over the horizon.
         step_min = int(self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES))
-        now = dt_util.utcnow()
         forecast: list[dict] = []
         for k in range(len(plan.temperature)):
             point = {
@@ -376,6 +445,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             result.applied = await climate_io.async_write_setpoint(
                 self.hass, climate_entity, core.runtime, result.recommended_setpoint
             )
+            # Remember the last good (undisturbed) setpoint so we can hold it if a
+            # disturbance starts on a later cycle.
+            if not disturbance:
+                core.hold_setpoint = result.recommended_setpoint
         return result
 
     # --------------------------------------------------------------- helpers
@@ -395,6 +468,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
     def reset_zone(self, zone_id: str) -> None:
         core = self._zones.get(zone_id)
         if core is not None:
-            core.rls = RecursiveLeastSquares()
+            core.rls = RecursiveLeastSquares(
+                outlier_sigma=OUTLIER_SIGMA, outlier_abs_cap=OUTLIER_ABS_CAP
+            )
             core.last_obs = None
+            core.disturbance_until = None
+            core.hold_setpoint = None
             self.store.clear_zone(zone_id)

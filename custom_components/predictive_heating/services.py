@@ -22,6 +22,10 @@ from .const import (
     CONF_ZONE_ID,
     DEFAULT_STEP_MINUTES,
     DOMAIN,
+    OUTLIER_ABS_CAP,
+    OUTLIER_SIGMA,
+    PLAUSIBLE_TEMP_MAX,
+    PLAUSIBLE_TEMP_MIN,
 )
 from .models.identification import RecursiveLeastSquares, batch_fit
 from .models.rc_model import RCModel
@@ -54,6 +58,11 @@ def _iter_coordinators(hass: HomeAssistant):
         if key == "master_enabled":
             continue
         yield value["coordinator"]
+
+
+def _plausible(value: float) -> bool:
+    """Reject sensor-fault readings (e.g. the 327.67 C sentinel) from training."""
+    return PLAUSIBLE_TEMP_MIN <= value <= PLAUSIBLE_TEMP_MAX
 
 
 def _resample(pairs, grid):
@@ -102,23 +111,25 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         try:
             if temp_sensor is None:
                 cur = state.attributes.get("current_temperature")
-                if cur is not None:
+                if cur is not None and _plausible(float(cur)):
                     indoor_pairs.append((ts, float(cur)))
             sp = state.attributes.get("temperature")
-            if sp is not None:
+            if sp is not None and _plausible(float(sp)):
                 setpoint_pairs.append((ts, float(sp)))
         except (TypeError, ValueError):
             continue
     if temp_sensor:
         for state in raw.get(temp_sensor, []):
             try:
-                indoor_pairs.append((state.last_changed, float(state.state)))
+                if _plausible(float(state.state)):
+                    indoor_pairs.append((state.last_changed, float(state.state)))
             except (TypeError, ValueError):
                 continue
     if outdoor_sensor:
         for state in raw.get(outdoor_sensor, []):
             try:
-                outdoor_pairs.append((state.last_changed, float(state.state)))
+                if _plausible(float(state.state)):
+                    outdoor_pairs.append((state.last_changed, float(state.state)))
             except (TypeError, ValueError):
                 continue
 
@@ -150,7 +161,14 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     zone_id = cfg[CONF_ZONE_ID]
     core = coordinator._zones.get(zone_id)
     if core is not None:
-        core.rls = RecursiveLeastSquares(params=model.params)
+        core.rls = RecursiveLeastSquares(
+            params=model.params,
+            outlier_sigma=OUTLIER_SIGMA,
+            outlier_abs_cap=OUTLIER_ABS_CAP,
+        )
+        core.last_obs = None
+        core.disturbance_until = None
+        core.hold_setpoint = None
     coordinator.store.set_model(zone_id, model)
     _LOGGER.info(
         "Bootstrapped zone %s from %d samples (rmse=%s)",

@@ -34,6 +34,11 @@ BINARY_SENSORS: tuple[ZoneBinaryDescription, ...] = (
         translation_key="free_heat",
         value_fn=lambda z: not z.has_authority,
     ),
+    ZoneBinaryDescription(
+        key="disturbance_detected",
+        translation_key="disturbance_detected",
+        value_fn=lambda z: z.disturbance,
+    ),
 )
 
 

@@ -24,6 +24,11 @@ bound to your location). No cloud, no API keys.
 - **No-control-authority awareness**: when sun or mild weather already pushes the room
   above setpoint, it recognises it cannot cool the room and simply **coasts**, flagging
   this on a binary sensor instead of fighting physics.
+- **Disturbance rejection**: sporadic events like an open window/door (the room cooling
+  far faster than physics predicts) and sensor-fault spikes are detected and *excluded*
+  from learning, so a transient never corrupts the model. While a disturbance is active
+  the controller freezes learning and holds the last good setpoint until the room
+  recovers (`binary_sensor.*_disturbance_detected`).
 
 ## Features
 
@@ -41,8 +46,13 @@ bound to your location). No cloud, no API keys.
 
 Per zone: `sensor.*_recommended_setpoint`, `sensor.*_predicted_temperature`,
 `sensor.*_estimated_setpoint_reduction`, diagnostic `sensor.*_model_fit_rmse`,
+diagnostic `sensor.*_prediction_error` (actual minus predicted),
 `binary_sensor.*_manual_override`, `binary_sensor.*_coasting_on_free_heat`,
+`binary_sensor.*_disturbance_detected`,
 `switch.*_predictive_control`, `number.*_comfort_minimum/target/maximum`.
+
+The `predicted_temperature` sensor also exposes a `forecast` attribute with the full
+predicted indoor-temperature trajectory over the horizon (for graphing with ApexCharts).
 
 Global: `switch` master *Predictive control*, `select` *Optimization profile*
 (comfort / balanced / eco / price).

@@ -7,8 +7,8 @@ from custom_components.predictive_heating.models.rc_model import RCModel
 
 
 def _model():
-    # Stable room with meaningful heating gain.
-    return RCModel(params=np.array([0.92, 0.06, 0.4, 0.35, 0.0]))
+    # Stable room with meaningful heating gain. params = [ka, ks, kh, kg].
+    return RCModel(params=np.array([0.08, 0.4, 0.35, 0.0]))
 
 
 def test_box_constraints_respected():

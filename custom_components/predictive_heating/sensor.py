@@ -65,6 +65,15 @@ SENSORS: tuple[ZoneSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z: z.fit_rmse,
     ),
+    ZoneSensorDescription(
+        key="prediction_error",
+        translation_key="prediction_error",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z: z.prediction_error,
+    ),
 )
 
 

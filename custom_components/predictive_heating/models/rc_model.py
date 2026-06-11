@@ -1,8 +1,13 @@
 """Grey-box RC thermal model for a single heating zone.
 
-Discrete 1R1C (single-state) model in regression form::
+Discrete single-state model written in **heat-balance / temperature-difference**
+form so it is well conditioned and physically meaningful::
 
-    T[k+1] = a * T[k] + b_out * T_out[k] + b_sol * Sol[k] + b_heat * u[k] + c
+    T[k+1] - T[k] = ka * (T_out[k] - T[k]) + ks * Sol[k] + kh * u[k] + kg
+
+equivalently::
+
+    T[k+1] = (1 - ka) * T[k] + ka * T_out[k] + ks * Sol[k] + kh * u[k] + kg
 
 where
 
@@ -10,13 +15,20 @@ where
 * ``T_out``  is the outdoor temperature (deg C),
 * ``Sol``    is a solar-gain proxy (0..1, derived from cloud cover / UV / sun elevation),
 * ``u``      is the heating-demand proxy ``max(0, setpoint - T)`` (deg C),
-* ``a``      is the thermal-storage / inertia coefficient (0 < a < 1),
-* ``b_*``    are the input gains and ``c`` an offset.
+* ``ka``     is the envelope coupling to outdoor (0 < ka < 1; small => slow / heavy mass),
+* ``ks``     is the solar-gain gain,
+* ``kh``     is the heating gain,
+* ``kg``     is a persistent **internal-gains offset** (deg C / step).
 
-The model is intentionally linear in its parameters so it can be identified with
-ordinary / recursive least squares, and linear in ``u`` so the controller (MPC) can
-build a convex QP. A richer 2R2C variant can be layered on later behind the same
-``predict`` interface.
+Why this form (vs an unconstrained ``T[k+1] = a T + b_out T_out + ... + c``):
+the difference form *ties* the outdoor coupling to the inertia (``a = 1 - ka``),
+so the steady state is ``T_ss = T_out + (ks*Sol + kh*u + kg) / ka``. The
+internal-gains term ``kg`` lets a room float several degrees above outdoor even
+with no heating -- which is exactly the summer regime. The previous unconstrained
+model could (and did) collapse predictions toward the outdoor temperature.
+
+The model stays linear in its parameters (identifiable with OLS/RLS) and linear in
+``u`` (so the controller builds a convex QP).
 
 References:
     Bacher & Madsen (2011), "Identifying suitable models for the heat dynamics of
@@ -29,23 +41,25 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# Parameter vector order: [a, b_out, b_sol, b_heat, c]
-N_PARAMS = 5
-PARAM_NAMES = ["a", "b_out", "b_sol", "b_heat", "c"]
+# Parameter vector order: [ka, ks, kh, kg]
+N_PARAMS = 4
+PARAM_NAMES = ["ka", "ks", "kh", "kg"]
 
-# Reasonable physical defaults for a well-damped underfloor-heated room at a
-# 30-minute step. Used as a prior before any data is fitted.
-DEFAULT_PARAMS = np.array([0.90, 0.05, 0.30, 0.20, 0.0], dtype=float)
+# Physically reasonable defaults for a heavy, well-damped underfloor-heated room
+# at a 30-minute step (prior before any data is fitted):
+#   ka=0.08  -> outdoor time constant ~ step/ka ~ 6 h
+#   ks=0.30  -> moderate solar gain
+#   kh=0.25  -> heating effectiveness
+#   kg=0.25  -> floats ~ kg/ka ~ 3 C above outdoor on internal gains alone
+DEFAULT_PARAMS = np.array([0.08, 0.30, 0.25, 0.25], dtype=float)
 
 
 @dataclass
 class RCModel:
     """A single-zone RC thermal model with identifiable parameters."""
 
-    params: np.ndarray = field(
-        default_factory=lambda: DEFAULT_PARAMS.copy()
-    )
-    rmse: float | None = None  # last-known fit quality, deg C
+    params: np.ndarray = field(default_factory=lambda: DEFAULT_PARAMS.copy())
+    rmse: float | None = None  # last-known one-step fit quality, deg C
     n_samples: int = 0
     step_minutes: float = 30.0
 
@@ -56,23 +70,37 @@ class RCModel:
         return max(0.0, float(setpoint) - float(indoor))
 
     @property
-    def a(self) -> float:
+    def ka(self) -> float:
         return float(self.params[0])
 
     @property
-    def b_heat(self) -> float:
+    def kh(self) -> float:
+        return float(self.params[2])
+
+    @property
+    def kg(self) -> float:
         return float(self.params[3])
+
+    @property
+    def a(self) -> float:
+        """Effective inertia coefficient ``a = 1 - ka`` (for the MPC matrices)."""
+        return float(1.0 - self.params[0])
+
+    @property
+    def b_heat(self) -> float:
+        return float(self.params[2])
 
     def regressor(
         self, indoor: float, t_out: float, sol: float, u: float
     ) -> np.ndarray:
-        """Build the regression row ``phi`` such that ``T_next = phi @ params``."""
-        return np.array([indoor, t_out, sol, u, 1.0], dtype=float)
+        """Difference-form regression row ``phi`` so ``T_next - T = phi @ params``."""
+        return np.array([t_out - indoor, sol, u, 1.0], dtype=float)
 
     # ------------------------------------------------------------------ predict
     def step(self, indoor: float, t_out: float, sol: float, u: float) -> float:
         """Advance one step and return the predicted next indoor temperature."""
-        return float(self.regressor(indoor, t_out, sol, u) @ self.params)
+        delta = float(self.regressor(indoor, t_out, sol, u) @ self.params)
+        return float(indoor) + delta
 
     def simulate(
         self,
@@ -126,7 +154,7 @@ class RCModel:
         t_free = t_free_full[1:]  # predictions for steps 1..n
 
         # Impulse response of a unit u at step j on temperature at step k:
-        #   contribution = b * a**(k-1-j) for k > j, else 0
+        #   contribution = b * a**(k-j) for k >= j, else 0
         g = np.zeros((n, n), dtype=float)
         for k in range(n):
             for j in range(k + 1):
@@ -147,6 +175,7 @@ class RCModel:
         params = np.array(
             data.get("params", DEFAULT_PARAMS.tolist()), dtype=float
         )
+        # Reset legacy (5-param) or malformed models to the new prior.
         if params.shape != (N_PARAMS,):
             params = DEFAULT_PARAMS.copy()
         return cls(

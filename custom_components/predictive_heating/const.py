@@ -55,6 +55,12 @@ DEFAULT_COMFORT_MAX = 23.0
 DEFAULT_COMFORT_TARGET = 21.0
 DEFAULT_PRICE_OPTIMIZE = False
 
+# Plausible indoor/setpoint temperature band (deg C). Readings outside this range
+# are treated as sensor faults (e.g. the 327.67 C sentinel some ESPHome/Wavin
+# sensors emit) and ignored so they never poison learning or control.
+PLAUSIBLE_TEMP_MIN = -10.0
+PLAUSIBLE_TEMP_MAX = 50.0
+
 # Control behaviour
 SETPOINT_DEADBAND = 0.2  # deg C; only write if change exceeds this
 MANUAL_OVERRIDE_TOLERANCE = 0.05  # deg C tolerance for detecting external setpoint change
@@ -70,6 +76,18 @@ MODE_WEIGHTS = {
 
 # Model fit quality: RMSE (deg C) below which autonomous control is allowed
 FIT_RMSE_AUTONOMY_THRESHOLD = 1.0
+
+# Disturbance / outlier rejection (windows, doors, sporadic transients)
+# One-step residual rejection thresholds for the online RLS estimator.
+OUTLIER_SIGMA = 4.0  # reject if |residual| > OUTLIER_SIGMA * robust scale
+OUTLIER_ABS_CAP = 1.5  # deg C; also reject if |residual| exceeds this absolute cap
+# A window/door disturbance is flagged when the measured temperature change falls
+# far *below* what the model expected (room cooling abnormally fast).
+DISTURBANCE_DROP_SIGMA = 4.0
+DISTURBANCE_DROP_MIN = 0.5  # deg C; minimum drop-below-prediction to flag
+# Once a disturbance is flagged we freeze learning and hold the last good setpoint
+# for at least this long, or until the temperature recovers.
+DISTURBANCE_HOLD = timedelta(minutes=60)
 
 # Storage
 STORAGE_VERSION = 1

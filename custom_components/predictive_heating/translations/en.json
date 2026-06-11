@@ -92,11 +92,13 @@
       "recommended_setpoint": { "name": "Recommended setpoint" },
       "predicted_temperature": { "name": "Predicted temperature" },
       "estimated_savings": { "name": "Estimated setpoint reduction" },
-      "fit_rmse": { "name": "Model fit RMSE" }
+      "fit_rmse": { "name": "Model fit RMSE" },
+      "prediction_error": { "name": "Prediction error (actual minus predicted)" }
     },
     "binary_sensor": {
       "manual_override": { "name": "Manual override active" },
-      "free_heat": { "name": "Coasting on free heat" }
+      "free_heat": { "name": "Coasting on free heat" },
+      "disturbance_detected": { "name": "Disturbance detected (window/door)" }
     },
     "switch": {
       "master_enable": { "name": "Autonomous control (master)" },
