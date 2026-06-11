@@ -35,7 +35,11 @@ bound to your location). No cloud, no API keys.
 - Up to **16 zones/rooms**; unconfigured zones are ignored.
 - Per zone you map: the **climate entity** (setpoint + temperature feedback), and
   optionally a separate temperature sensor, an outdoor-temperature sensor, and a solar
-  irradiance sensor.
+  irradiance sensor. **The irradiance sensor is optional** — provide one only if you
+  have a real measurement in **W/m²** (device class `irradiance`, e.g. a weather
+  station or Solcast; ~1000 W/m² ≈ full sun). If you leave it empty, the solar-gain
+  term is estimated automatically from the weather entity's cloud cover and UV index,
+  so most users do **not** need a separate sensor.
 - **Autonomous with guardrails**: a master switch, per-zone comfort min/max, automatic
   back-off when you change a setpoint by hand, and an advisory mode that only
   *recommends* until the model has learned enough.

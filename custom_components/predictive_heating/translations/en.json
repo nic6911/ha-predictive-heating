@@ -57,6 +57,10 @@
           "comfort_max": "Comfort maximum (°C)",
           "zone_mode": "Control mode",
           "enabled": "Enabled"
+        },
+        "data_description": {
+          "outdoor_sensor": "Optional. A temperature sensor (°C). If omitted, the outdoor temperature from the location-bound weather entity is used.",
+          "irradiance_sensor": "Optional. A solar irradiance sensor in W/m² (device class 'irradiance', e.g. from a weather station or Solcast). ~1000 W/m² is treated as full sun. If omitted, a solar-gain estimate is derived automatically from the weather entity's cloud cover and UV index, so you do not need a sensor here."
         }
       },
       "remove_zone": {
