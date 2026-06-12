@@ -165,11 +165,19 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
             params=model.params,
             outlier_sigma=OUTLIER_SIGMA,
             outlier_abs_cap=OUTLIER_ABS_CAP,
+            bias=model.bias,
         )
         core.last_obs = None
+        core.last_buffer_obs = None
         core.disturbance_until = None
         core.hold_setpoint = None
+        # Seed the stable forecast model, rolling buffer and offset-free bias so the
+        # zone immediately forecasts/controls from the robust batch fit.
+        core.model = model
+        core.buffer = [list(s) for s in samples]
+        core.bias = model.bias
     coordinator.store.set_model(zone_id, model)
+    coordinator.store.set_buffer(zone_id, [list(s) for s in samples])
     _LOGGER.info(
         "Bootstrapped zone %s from %d samples (rmse=%s)",
         zone_id,

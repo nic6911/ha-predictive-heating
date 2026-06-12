@@ -14,7 +14,7 @@ Each cycle, for every enabled zone:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 import logging
 
@@ -53,6 +53,9 @@ from .const import (
     DEFAULT_MODE,
     DEFAULT_STEP_MINUTES,
     DEFAULT_UPDATE_INTERVAL,
+    BUFFER_DAYS,
+    REFIT_INTERVAL_HOURS,
+    MIN_REFIT_SAMPLES,
     DISTURBANCE_DROP_MIN,
     DISTURBANCE_DROP_SIGMA,
     DISTURBANCE_HOLD,
@@ -69,7 +72,7 @@ from .forecast import (
     async_get_weather_forecast,
     solar_proxy,
 )
-from .models.identification import RecursiveLeastSquares
+from .models.identification import BIAS_ALPHA, RecursiveLeastSquares, batch_fit
 from .models.rc_model import RCModel
 from .storage import ModelStore
 
@@ -121,6 +124,16 @@ class _ZoneCore:
     # setpoint is held, plus the setpoint to hold.
     disturbance_until: object | None = None
     hold_setpoint: float | None = None
+    # Stable model used for forecasting/control: the robust batch fit, periodically
+    # re-identified from ``buffer`` (NOT the wandering online RLS). ``bias`` is the
+    # online offset-free output-disturbance correction applied to its rollout.
+    model: RCModel | None = None
+    buffer: list = field(default_factory=list)  # rows: [indoor, t_out, sol, u, next]
+    bias: float = 0.0
+    # Observation anchoring the next *step-spaced* buffer transition. Buffer samples
+    # are formed at ~``step_minutes`` spacing (a uniform grid) regardless of the
+    # faster control-update cadence, so the batch fit sees consistent-interval data.
+    last_buffer_obs: dict | None = None
 
 
 class PredictiveHeatingCoordinator(DataUpdateCoordinator):
@@ -136,6 +149,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         self.mode_override: str | None = None
         self._cycle = 0
         interval = self._global(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+        # Re-identify the batch model on a slow cadence (cycles per REFIT interval).
+        self._refit_cycles = max(1, int(round(REFIT_INTERVAL_HOURS * 60 / interval)))
         super().__init__(
             hass,
             _LOGGER,
@@ -169,11 +184,15 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 params=params,
                 outlier_sigma=OUTLIER_SIGMA,
                 outlier_abs_cap=OUTLIER_ABS_CAP,
+                bias=model.bias if model else 0.0,
             )
             self._zones[zone_id] = _ZoneCore(
                 config=cfg,
                 rls=rls,
                 runtime=climate_io.ZoneRuntime(zone_id=zone_id),
+                model=model,
+                buffer=[list(row) for row in self.store.get_buffer(zone_id)],
+                bias=model.bias if model else 0.0,
             )
 
     def zone_param(self, zone_id: str, key: str, default):
@@ -332,10 +351,70 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 core.disturbance_until = None
 
             if not disturbance:
-                # Innovation-gated RLS update (also rejects lone outliers internally).
+                # Innovation-gated RLS update (kept for one-step residual scale and
+                # disturbance detection only -- NOT used for the forecast).
                 core.rls.update(phi_d, measured_delta)
 
         result.disturbance = disturbance
+
+        step_min = self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES)
+
+        # ---- Step-spaced buffering for the stable batch fit ------------------
+        # The control loop runs faster than the model step. Build buffer samples on
+        # a uniform ~``step_minutes`` grid so the batch fit (and the offset-free
+        # bias) see consistent-interval transitions -- exactly the grid the offline
+        # validation used. A disturbance freezes buffering and re-anchors the grid
+        # so no transition ever spans an open-window event.
+        if indoor is not None and current_setpoint is not None:
+            lb = core.last_buffer_obs
+            elapsed_ok = (
+                lb is not None
+                and (now - lb["time"]).total_seconds() >= 0.9 * step_min * 60
+            )
+            if disturbance:
+                core.last_buffer_obs = None  # break the grid across the disturbance
+            elif elapsed_ok:
+                core.buffer.append(
+                    [lb["indoor"], lb["t_out"], lb["sol"], lb["u"], indoor]
+                )
+                # Online offset-free bias ``d``: EW mean of accepted step residuals of
+                # the stable batch model, so the multi-step rollout stays unbiased
+                # under slow drift / model mismatch (Pannocchia & Rawlings, 2003).
+                if core.model is not None:
+                    phi_lb = np.array(
+                        [lb["t_out"] - lb["indoor"], lb["sol"], lb["u"], 1.0]
+                    )
+                    r = (indoor - lb["indoor"]) - float(phi_lb @ core.model.params)
+                    if abs(r) <= OUTLIER_ABS_CAP:
+                        core.bias = (1.0 - BIAS_ALPHA) * core.bias + BIAS_ALPHA * r
+                        core.bias = float(np.clip(core.bias, -0.5, 0.5))
+                core.last_buffer_obs = None  # consumed -> re-anchor below
+            if core.last_buffer_obs is None:
+                core.last_buffer_obs = {
+                    "indoor": indoor,
+                    "t_out": t_out_now,
+                    "sol": sol_now,
+                    "u": RCModel.heat_demand(current_setpoint, indoor),
+                    "time": now,
+                }
+
+        # Cap the rolling buffer to the most recent BUFFER_DAYS of samples.
+        max_samples = max(MIN_REFIT_SAMPLES, int(BUFFER_DAYS * 24 * 60 / step_min))
+        if len(core.buffer) > max_samples:
+            del core.buffer[: len(core.buffer) - max_samples]
+
+        # Periodically re-identify the stable batch model from the buffer. This is
+        # what the MPC/forecast use -- robust, regularised and excitation-guarded, so
+        # the open-loop horizon does not drift the way the online RLS does.
+        if (
+            self._cycle % self._refit_cycles == 0
+            and len(core.buffer) >= MIN_REFIT_SAMPLES
+        ):
+            first_fit = core.model is None
+            core.model = batch_fit(core.buffer, step_minutes=step_min)
+            if first_fit:
+                # Seed the online bias from the batch median residual once.
+                core.bias = core.model.bias
 
         # Record this observation for next cycle's learning / detection.
         if indoor is not None and current_setpoint is not None:
@@ -346,7 +425,12 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 "u": RCModel.heat_demand(current_setpoint, indoor),
             }
 
-        model = core.rls.to_model(step_minutes=self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES))
+        # Forecast/control from the stable batch model + online bias. Fall back to
+        # the RLS estimate only at cold start before the first batch refit exists.
+        if core.model is not None:
+            model = replace(core.model, bias=float(np.clip(core.bias, -0.5, 0.5)))
+        else:
+            model = core.rls.to_model(step_minutes=step_min)
         result.fit_rmse = model.rmse
 
         # We still compute predictions/recommendations when the zone is disabled
@@ -457,7 +541,14 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
 
     async def _persist(self) -> None:
         for zone_id, core in self._zones.items():
-            self.store.set_model(zone_id, core.rls.to_model())
+            if core.model is not None:
+                model = replace(
+                    core.model, bias=float(np.clip(core.bias, -0.5, 0.5))
+                )
+            else:
+                model = core.rls.to_model()
+            self.store.set_model(zone_id, model)
+            self.store.set_buffer(zone_id, [list(row) for row in core.buffer])
         await self.store.async_save()
 
     async def async_train_zone_from_history(self, zone_id: str) -> None:
@@ -472,6 +563,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 outlier_sigma=OUTLIER_SIGMA, outlier_abs_cap=OUTLIER_ABS_CAP
             )
             core.last_obs = None
+            core.last_buffer_obs = None
             core.disturbance_until = None
             core.hold_setpoint = None
+            core.model = None
+            core.buffer = []
+            core.bias = 0.0
             self.store.clear_zone(zone_id)

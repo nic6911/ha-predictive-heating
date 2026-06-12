@@ -62,6 +62,13 @@ class RCModel:
     rmse: float | None = None  # last-known one-step fit quality, deg C
     n_samples: int = 0
     step_minutes: float = 30.0
+    # Offset-free output-disturbance correction (deg C / step). A slowly-varying
+    # scalar that is added to every simulated step so the open-loop forecast stays
+    # unbiased even when the (necessarily simplified) RC dynamics are slightly
+    # misspecified -- the standard offset-free / disturbance-model trick from MPC
+    # (Pannocchia & Rawlings, 2003). It is learned online from accepted one-step
+    # residuals; it is NOT a tuned constant.
+    bias: float = 0.0
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -99,7 +106,7 @@ class RCModel:
     # ------------------------------------------------------------------ predict
     def step(self, indoor: float, t_out: float, sol: float, u: float) -> float:
         """Advance one step and return the predicted next indoor temperature."""
-        delta = float(self.regressor(indoor, t_out, sol, u) @ self.params)
+        delta = float(self.regressor(indoor, t_out, sol, u) @ self.params) + self.bias
         return float(indoor) + delta
 
     def simulate(
@@ -168,6 +175,7 @@ class RCModel:
             "rmse": self.rmse,
             "n_samples": self.n_samples,
             "step_minutes": self.step_minutes,
+            "bias": self.bias,
         }
 
     @classmethod
@@ -183,4 +191,5 @@ class RCModel:
             rmse=data.get("rmse"),
             n_samples=int(data.get("n_samples", 0)),
             step_minutes=float(data.get("step_minutes", 30.0)),
+            bias=float(data.get("bias", 0.0)),
         )

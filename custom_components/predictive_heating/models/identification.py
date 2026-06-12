@@ -26,7 +26,12 @@ from .rc_model import DEFAULT_PARAMS, N_PARAMS, RCModel
 
 # Bounds keep identified parameters physically sane and the model stable.
 # Order: [ka, ks, kh, kg]
-PARAM_LOWER = np.array([0.01, 0.0, 0.0, -2.0], dtype=float)
+# ka's lower bound corresponds to the slowest envelope time constant we allow
+# (step/ka): at a 30-min step ka=0.005 -> ~100 h, which comfortably covers very
+# heavy, well-insulated slab systems. (Heavier than this and the open-loop steady
+# state ``T_out + (...)/ka`` becomes hyper-sensitive; the offset-free bias term
+# keeps the forecast honest regardless.)
+PARAM_LOWER = np.array([0.005, 0.0, 0.0, -2.0], dtype=float)
 PARAM_UPPER = np.array([0.50, 2.0, 1.0, 4.0], dtype=float)
 
 # Below this standard deviation of the heating proxy ``u`` (deg C) we consider the
@@ -35,6 +40,12 @@ EXCITATION_U_STD = 0.15
 
 # Huber threshold (deg C) for robust IRLS residual weighting.
 HUBER_DELTA = 0.4
+
+# Exponential-forgetting rate for the online output-bias estimate ``d``. Small ->
+# slow, stable drift tracking (~1-2 days of memory at typical update intervals).
+# Chosen by an offline forgetting-factor sweep on a year of data; it is a learning
+# rate, not a building-specific constant.
+BIAS_ALPHA = 0.02
 
 
 def _clip_params(params: np.ndarray) -> np.ndarray:
@@ -121,15 +132,23 @@ def batch_fit(
         theta[c] = theta_sub[i]
     theta = _clip_params(theta)
 
-    # One-step RMSE on the original (un-substituted) targets.
+    # One-step RMSE on the original (un-substituted) targets, plus a robust seed
+    # for the offset-free bias ``d`` (median residual). Seeding ``d`` here means a
+    # freshly bootstrapped zone already produces an unbiased open-loop forecast
+    # instead of waiting for the online estimate to converge.
     phi_full, y_full = _build_matrices(samples)
     residuals = y_full - phi_full @ theta
-    rmse = float(np.sqrt(np.mean(residuals**2))) if len(residuals) else None
+    bias = float(np.median(residuals)) if len(residuals) else 0.0
+    bias = float(np.clip(bias, -0.5, 0.5))
+    rmse = (
+        float(np.sqrt(np.mean((residuals - bias) ** 2))) if len(residuals) else None
+    )
     return RCModel(
         params=theta,
         rmse=rmse,
         n_samples=len(samples),
         step_minutes=step_minutes,
+        bias=bias,
     )
 
 
@@ -149,6 +168,7 @@ class RecursiveLeastSquares:
         p0: float = 1e3,
         outlier_sigma: float = 4.0,
         outlier_abs_cap: float = 1.5,
+        bias: float = 0.0,
     ) -> None:
         self.theta = (
             DEFAULT_PARAMS.copy() if params is None else np.asarray(params, float)
@@ -159,6 +179,12 @@ class RecursiveLeastSquares:
         self.P = np.eye(N_PARAMS) * p0
         self.outlier_sigma = float(outlier_sigma)
         self.outlier_abs_cap = float(outlier_abs_cap)
+        # Offset-free output-disturbance estimate ``d`` (deg C / step): an EW mean
+        # of accepted one-step residuals. Added to every simulated step so the
+        # multi-step open-loop forecast stays unbiased under slow drift / model
+        # mismatch. Only *accepted* (non-outlier, non-disturbance) samples move it,
+        # so window-opening transients cannot poison it.
+        self.bias = float(bias)
         # Robust running residual scale (EW mean of |err|).
         self._scale: float | None = None
         self._sq_err = 0.0
@@ -186,6 +212,8 @@ class RecursiveLeastSquares:
         sample was used to update the model, ``False`` if it was rejected.
         """
         phi = np.asarray(phi, dtype=float).reshape(-1)
+        # A-priori residual *excluding* the bias term, so the bias estimate tracks
+        # the mean one-step error rather than chasing its own correction.
         err = float(target) - float(phi @ self.theta)
         self.last_residual = err
 
@@ -209,6 +237,11 @@ class RecursiveLeastSquares:
             self._scale = abs(err) + 1e-3
         else:
             self._scale = 0.97 * self._scale + 0.03 * abs(err)
+        # Update the offset-free bias ``d`` (EW mean of accepted residuals). The
+        # innovation gate above already excluded outliers, so this slow average
+        # captures genuine drift, not transients. Bounded as a physical safety rail.
+        self.bias = (1.0 - BIAS_ALPHA) * self.bias + BIAS_ALPHA * err
+        self.bias = float(np.clip(self.bias, -0.5, 0.5))
         self._sq_err += err * err
         self._count += 1
         self.last_rejected = False
@@ -226,4 +259,5 @@ class RecursiveLeastSquares:
             rmse=self.rmse,
             n_samples=n_samples or self._count,
             step_minutes=step_minutes,
+            bias=self.bias,
         )
