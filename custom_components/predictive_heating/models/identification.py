@@ -38,6 +38,15 @@ PARAM_UPPER = np.array([0.50, 2.0, 1.0, 4.0], dtype=float)
 # data un-excited for heating and refuse to identify ``kh`` (hold it at the prior).
 EXCITATION_U_STD = 0.15
 
+# Below this standard deviation of the solar proxy (0..1) the data carries no usable
+# solar variation, so ``ks`` is not identifiable. In that case we hold ``ks`` at ZERO
+# (not the prior) -- a non-zero prior solar gain multiplied by the real solar forecast
+# would otherwise inject phantom daytime heat and make the open-loop horizon drift up
+# (e.g. a winter/no-solar bootstrap forecasting into a sunny summer day). ``ks`` is
+# re-identified automatically as soon as a fit window contains real day/night solar
+# swing. This is an excitation/identifiability guard, not a building-specific constant.
+EXCITATION_SOL_STD = 0.05
+
 # Huber threshold (deg C) for robust IRLS residual weighting.
 HUBER_DELTA = 0.4
 
@@ -102,18 +111,33 @@ def batch_fit(
     phi, y = _build_matrices(samples)
     prior = DEFAULT_PARAMS.copy()
 
-    # Excitation guard: if there is essentially no heating in the data, do not try
-    # to identify the heating gain kh -- hold it at the prior and fit the rest.
+    # Excitation guards: only identify a gain when its regressor is actually excited.
+    #   * heating gain kh (col 2): if the heating proxy barely moves, hold kh at the
+    #     prior (substitute prior*u into the target) -- a bounded, controlled input.
+    #   * solar gain ks (col 1): if the solar proxy barely moves, hold ks at ZERO, so
+    #     an unidentified prior can never be multiplied by the real solar forecast.
+    # ka (col 0) and kg (col 3) are always identified.
+    sol_col = phi[:, 1]
     u_col = phi[:, 2]
+    fit_sol = float(np.std(sol_col)) >= EXCITATION_SOL_STD
     fit_heat = float(np.std(u_col)) >= EXCITATION_U_STD
+
+    cols = [0, 3]
+    if fit_sol:
+        cols.append(1)
     if fit_heat:
-        cols = [0, 1, 2, 3]
+        cols.append(2)
     else:
-        cols = [0, 1, 3]  # drop kh column; substitute prior*u into the target
+        # Hold kh at the prior by folding its contribution into the target.
         y = y - prior[2] * u_col
+    cols = sorted(cols)
 
     phi_sub = phi[:, cols]
-    prior_sub = prior[cols]
+    # Shrink toward the prior, except ks which (when fitted) shrinks toward 0 to avoid
+    # re-introducing the phantom-solar prior on weakly-excited windows.
+    prior_sub = prior[cols].copy()
+    if fit_sol:
+        prior_sub[cols.index(1)] = 0.0
 
     # Iteratively re-weighted least squares with Huber weights for robustness.
     w = np.ones(len(y), dtype=float)
@@ -126,8 +150,11 @@ def batch_fit(
         a = np.abs(resid)
         w = np.where(a <= delta, 1.0, delta / np.maximum(a, 1e-9))
 
-    # Reassemble the full parameter vector.
+    # Reassemble the full parameter vector. kh defaults to its prior when un-excited;
+    # ks defaults to ZERO when un-excited (never the phantom-solar prior).
     theta = prior.copy()
+    if not fit_sol:
+        theta[1] = 0.0
     for i, c in enumerate(cols):
         theta[c] = theta_sub[i]
     theta = _clip_params(theta)

@@ -32,6 +32,31 @@ def solar_proxy(cloud_coverage, uv_index) -> float:
     return float(clear * (1.0 - 0.7 * cloud / 100.0))
 
 
+def clear_sky_index(when: datetime, latitude: float, longitude: float) -> float:
+    """Astronomical clear-sky solar proxy (0..1) from the sun's elevation.
+
+    Pure geometry, no external service. Used to *reconstruct* a historical solar
+    driver during bootstrap training: recorded cloud/UV history is not available,
+    so without this the solar column is constant and ``ks`` cannot be identified
+    (it would fall back to a prior and inject phantom daytime heat into the
+    forecast). The amplitude is scaled to roughly match :func:`solar_proxy`
+    (clear summer midday ~0.8); the RC model's ``ks`` learns the exact scaling.
+    """
+    import math
+
+    doy = when.timetuple().tm_yday
+    utc_hour = when.hour + when.minute / 60.0 + when.second / 3600.0
+    solar_time = utc_hour + longitude / 15.0
+    decl = math.radians(23.45) * math.sin(math.radians(360.0 * (284 + doy) / 365.0))
+    ha = math.radians(15.0 * (solar_time - 12.0))
+    latr = math.radians(latitude)
+    sin_elev = (
+        math.sin(latr) * math.sin(decl)
+        + math.cos(latr) * math.cos(decl) * math.cos(ha)
+    )
+    return max(0.0, sin_elev)
+
+
 def _grid(now: datetime, n: int, step_minutes: float) -> list[datetime]:
     return [now + timedelta(minutes=step_minutes * k) for k in range(n)]
 

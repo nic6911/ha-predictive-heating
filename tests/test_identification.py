@@ -63,6 +63,27 @@ def test_excitation_guard_holds_heating_gain_without_excitation():
     assert np.isclose(model.params[2], DEFAULT_PARAMS[2])
 
 
+def test_excitation_guard_holds_solar_gain_without_excitation():
+    """With a constant (un-exciting) solar column, ks must be held at 0, not the
+    prior. A pinned prior ks multiplied by a real (sunny) solar forecast injects
+    phantom daytime heat and drifts the horizon high -- the v0.3.0 summer bug."""
+    rng = np.random.default_rng(3)
+    model = RCModel(params=np.array([0.08, 0.30, 0.25, 0.25]))
+    samples = []
+    indoor = 20.0
+    for _ in range(500):
+        t_out = rng.uniform(-5, 12)
+        sol = 0.0  # historical/bootstrap solar unavailable -> constant column
+        u = rng.uniform(0.0, 4.0)
+        nxt = model.step(indoor, t_out, sol, u) + rng.normal(0, 0.01)
+        samples.append((indoor, t_out, sol, u, nxt))
+        indoor = nxt
+        if indoor < 10 or indoor > 30:
+            indoor = 20.0
+    fitted = batch_fit(samples)
+    assert np.isclose(fitted.params[1], 0.0)
+
+
 def test_rls_rejects_outlier_sample():
     """A gross one-step outlier must be rejected and leave parameters intact."""
     true = [0.08, 0.30, 0.25, 0.25]

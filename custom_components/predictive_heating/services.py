@@ -27,6 +27,7 @@ from .const import (
     PLAUSIBLE_TEMP_MAX,
     PLAUSIBLE_TEMP_MIN,
 )
+from .forecast import clear_sky_index
 from .models.identification import RecursiveLeastSquares, batch_fit
 from .models.rc_model import RCModel
 
@@ -145,6 +146,9 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     setpoint = _resample(setpoint_pairs, grid)
     outdoor = _resample(outdoor_pairs, grid) if outdoor_pairs else [None] * n
 
+    lat = hass.config.latitude if hass.config.latitude is not None else 0.0
+    lon = hass.config.longitude if hass.config.longitude is not None else 0.0
+
     samples = []
     for k in range(n - 1):
         if (
@@ -155,7 +159,8 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
             continue
         t_out = outdoor[k] if outdoor[k] is not None else 8.0
         u = RCModel.heat_demand(setpoint[k], indoor[k])
-        samples.append((indoor[k], t_out, 0.0, u, indoor[k + 1]))
+        sol = clear_sky_index(grid[k], lat, lon)
+        samples.append((indoor[k], t_out, sol, u, indoor[k + 1]))
 
     model = batch_fit(samples, step_minutes=step_min)
     zone_id = cfg[CONF_ZONE_ID]
