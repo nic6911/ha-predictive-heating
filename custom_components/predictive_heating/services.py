@@ -19,6 +19,7 @@ from .const import (
     CONF_OUTDOOR_SENSOR,
     CONF_STEP_MINUTES,
     CONF_TEMP_SENSOR,
+    CONF_WEATHER_ENTITY,
     CONF_ZONE_ID,
     DEFAULT_STEP_MINUTES,
     DOMAIN,
@@ -87,6 +88,15 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     temp_sensor = cfg.get(CONF_TEMP_SENSOR)
     outdoor_sensor = cfg.get(CONF_OUTDOOR_SENSOR)
     step_min = coordinator._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES)
+    # When no dedicated outdoor sensor is configured, reconstruct the outdoor
+    # temperature history from the configured weather entity's recorded
+    # ``temperature`` attribute -- the SAME signal the live forecast uses. A
+    # constant fallback would make the (T_out - T_indoor) regressor nearly
+    # constant, leaving ka/kg unidentifiable so the open-loop horizon drifts to
+    # an implausible steady state (Bacher & Madsen 2011; see ITERATION 3.2).
+    weather_entity = (
+        None if outdoor_sensor else coordinator._global(CONF_WEATHER_ENTITY)
+    )
 
     end = dt_util.utcnow()
     start = end - timedelta(days=days)
@@ -95,6 +105,8 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         entity_ids.append(temp_sensor)
     if outdoor_sensor:
         entity_ids.append(outdoor_sensor)
+    elif weather_entity:
+        entity_ids.append(weather_entity)
 
     raw = await get_instance(hass).async_add_executor_job(
         history.get_significant_states,
@@ -133,6 +145,16 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
                     outdoor_pairs.append((state.last_changed, float(state.state)))
             except (TypeError, ValueError):
                 continue
+    elif weather_entity:
+        for state in raw.get(weather_entity, []):
+            temp = state.attributes.get("temperature")
+            if temp is None:
+                continue
+            try:
+                if _plausible(float(temp)):
+                    outdoor_pairs.append((state.last_changed, float(temp)))
+            except (TypeError, ValueError):
+                continue
 
     if len(indoor_pairs) < 10:
         _LOGGER.warning(
@@ -145,6 +167,16 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     indoor = _resample(indoor_pairs, grid)
     setpoint = _resample(setpoint_pairs, grid)
     outdoor = _resample(outdoor_pairs, grid) if outdoor_pairs else [None] * n
+    # Back-fill leading grid points (before the first recorded outdoor reading)
+    # with the first real value rather than fabricating a constant, so the
+    # outdoor regressor stays representative and ka/kg remain identifiable.
+    first_outdoor = next((v for v in outdoor if v is not None), None)
+    if first_outdoor is not None:
+        for k in range(n):
+            if outdoor[k] is None:
+                outdoor[k] = first_outdoor
+            else:
+                break
 
     lat = hass.config.latitude if hass.config.latitude is not None else 0.0
     lon = hass.config.longitude if hass.config.longitude is not None else 0.0
