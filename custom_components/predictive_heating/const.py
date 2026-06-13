@@ -145,6 +145,13 @@ DEFAULT_K_MEM = 0.15
 N_PARAMS_STANDARD = 4  # [ka, ks, kh, kg]
 N_PARAMS_ENHANCED = 5  # [ka, ks, kh, kg, k_mem]
 
+# Hourly bias (time-varying internal gains schedule).
+# Number of hours in a day for the per-hour bias array.
+N_HOURS = 24
+# EWMA learning rate for online per-hour bias updates. Each hour bucket gets
+# ~2 updates/day at 30-min steps; alpha=0.1 gives ~10-update (~5 day) time constant.
+HBIAS_ALPHA = 0.1
+
 # Storage
 STORAGE_VERSION = 1
 STORAGE_KEY = "predictive_heating_models"

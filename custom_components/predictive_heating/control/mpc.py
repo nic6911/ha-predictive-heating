@@ -55,8 +55,13 @@ def solve(
     w_energy: float,
     u_max: float = 6.0,
     iterations: int = 400,
+    start_hour: int = 0,
 ) -> MPCResult:
-    """Solve the economic MPC and return the optimal plan."""
+    """Solve the economic MPC and return the optimal plan.
+
+    ``start_hour`` is the UTC hour of day for the first forecast step (used
+    by the model's time-varying bias schedule).
+    """
     t_out = np.asarray(t_out, dtype=float)
     sol = np.asarray(sol, dtype=float)
     price = np.asarray(price, dtype=float)
@@ -71,7 +76,7 @@ def solve(
             objective=0.0,
         )
 
-    t_free, g = model.prediction_matrices(t0, t_out, sol)
+    t_free, g = model.prediction_matrices(t0, t_out, sol, start_hour=start_hour)
 
     # One-sided penalties weighted relative to the comfort weight.
     w_cold = max(w_comfort * 8.0, 5.0)

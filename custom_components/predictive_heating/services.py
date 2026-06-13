@@ -192,7 +192,8 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         t_out = outdoor[k] if outdoor[k] is not None else 8.0
         u = RCModel.heat_demand(setpoint[k], indoor[k])
         sol = clear_sky_index(grid[k], lat, lon)
-        samples.append((indoor[k], t_out, sol, u, indoor[k + 1]))
+        hour = grid[k].hour  # UTC hour for hourly bias initialisation
+        samples.append((indoor[k], t_out, sol, u, indoor[k + 1], hour))
 
     model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
     model = batch_fit(samples, step_minutes=step_min, model_type=model_type)
@@ -207,11 +208,11 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         core.last_buffer_obs = None
         core.disturbance_until = None
         core.hold_setpoint = None
-        # Seed the stable forecast model, rolling buffer and offset-free bias so the
+        # Seed the stable forecast model, rolling buffer and hourly bias so the
         # zone immediately forecasts/controls from the robust batch fit.
         core.model = model
         core.buffer = [list(s) for s in samples]
-        core.bias = model.bias
+        core.hourly_bias = model.hourly_bias.copy()
     coordinator.store.set_model(zone_id, model)
     coordinator.store.set_buffer(zone_id, [list(s) for s in samples])
     _LOGGER.info(

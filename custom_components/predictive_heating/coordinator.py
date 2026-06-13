@@ -64,6 +64,7 @@ from .const import (
     DISTURBANCE_HOLD,
     DOMAIN,
     FIT_RMSE_AUTONOMY_THRESHOLD,
+    HBIAS_ALPHA,
     MIN_REFIT_SAMPLES,
     MODE_WEIGHTS,
     OUTLIER_ABS_CAP,
@@ -130,11 +131,11 @@ class _ZoneCore:
     disturbance_until: object | None = None
     hold_setpoint: float | None = None
     # Stable model used for forecasting/control: the robust batch fit, periodically
-    # re-identified from ``buffer`` (NOT the wandering online RLS). ``bias`` is the
-    # online offset-free output-disturbance correction applied to its rollout.
+    # re-identified from ``buffer`` (NOT the wandering online RLS).
     model: RCModel | None = None
-    buffer: list = field(default_factory=list)  # rows: [indoor, t_out, sol, u, next]
-    bias: float = 0.0
+    buffer: list = field(default_factory=list)  # rows: [indoor, t_out, sol, u, next, hour]
+    # Online time-varying output-disturbance correction (deg C / step, per hour).
+    hourly_bias: np.ndarray = field(default_factory=lambda: np.zeros(24))
     # Observation anchoring the next *step-spaced* buffer transition. Buffer samples
     # are formed at ~``step_minutes`` spacing (a uniform grid) regardless of the
     # faster control-update cadence, so the batch fit sees consistent-interval data.
@@ -196,7 +197,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 runtime=climate_io.ZoneRuntime(zone_id=zone_id),
                 model=model,
                 buffer=[list(row) for row in self.store.get_buffer(zone_id)],
-                bias=model.bias if model else 0.0,
+                hourly_bias=model.hourly_bias.copy() if (model is not None and model.hourly_bias is not None) else np.zeros(24),
             )
 
     def zone_param(self, zone_id: str, key: str, default):
@@ -374,6 +375,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         # bias) see consistent-interval transitions -- exactly the grid the offline
         # validation used. A disturbance freezes buffering and re-anchors the grid
         # so no transition ever spans an open-window event.
+        # Each buffer row: [indoor, t_out, sol, u, next, hour_of_day].
         if indoor is not None and current_setpoint is not None:
             lb = core.last_buffer_obs
             elapsed_ok = (
@@ -383,20 +385,25 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             if disturbance:
                 core.last_buffer_obs = None  # break the grid across the disturbance
             elif elapsed_ok:
+                hour = lb["time"].hour  # UTC hour of the sample start
                 core.buffer.append(
-                    [lb["indoor"], lb["t_out"], lb["sol"], lb["u"], indoor]
+                    [lb["indoor"], lb["t_out"], lb["sol"], lb["u"], indoor, hour]
                 )
-                # Online offset-free bias ``d``: EW mean of accepted step residuals of
-                # the stable batch model, so the multi-step rollout stays unbiased
-                # under slow drift / model mismatch (Pannocchia & Rawlings, 2003).
+                # Online time-varying bias ``hourly_bias[h]``: per-hour EWMA of
+                # accepted step residuals of the stable batch model, so the
+                # multi-step open-loop forecast captures diurnal occupancy pattern
+                # (Lin et al., 2024, two-step identification).
                 if core.model is not None:
                     phi_lb = core.model.regressor(
                         lb["indoor"], lb["t_out"], lb["sol"], lb["u"]
                     )
                     r = (indoor - lb["indoor"]) - float(phi_lb @ core.model.params)
-                    if abs(r) <= OUTLIER_ABS_CAP:
-                        core.bias = (1.0 - BIAS_ALPHA) * core.bias + BIAS_ALPHA * r
-                        core.bias = float(np.clip(core.bias, -0.5, 0.5))
+                    if abs(r) <= OUTLIER_ABS_CAP and 0 <= hour < 24:
+                        core.hourly_bias[hour] = (
+                            (1.0 - HBIAS_ALPHA) * core.hourly_bias[hour]
+                            + HBIAS_ALPHA * r
+                        )
+                        core.hourly_bias = np.clip(core.hourly_bias, -0.5, 0.5)
                 core.last_buffer_obs = None  # consumed -> re-anchor below
             if core.last_buffer_obs is None:
                 core.last_buffer_obs = {
@@ -425,8 +432,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 core.buffer, step_minutes=step_min, model_type=model_type
             )
             if first_fit:
-                # Seed the online bias from the batch median residual once.
-                core.bias = core.model.bias
+                # Seed the online hourly bias from the batch fit.
+                core.hourly_bias = core.model.hourly_bias.copy()
 
         # Record this observation for next cycle's learning / detection.
         if indoor is not None and current_setpoint is not None:
@@ -437,10 +444,11 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 "u": RCModel.heat_demand(current_setpoint, indoor),
             }
 
-        # Forecast/control from the stable batch model + online bias. Fall back to
-        # the RLS estimate only at cold start before the first batch refit exists.
+        # Forecast/control from the stable batch model + online hourly bias.
+        # Fall back to the RLS estimate only at cold start before the first
+        # batch refit exists.
         if core.model is not None:
-            model = replace(core.model, bias=float(np.clip(core.bias, -0.5, 0.5)))
+            model = replace(core.model, hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5))
         else:
             model = core.rls.to_model(step_minutes=step_min)
         result.fit_rmse = model.rmse
@@ -461,6 +469,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             self.zone_param(zone_id, CONF_COMFORT_MAX, DEFAULT_COMFORT_MAX)
         )
 
+        first_step = now + timedelta(minutes=step_min)
+        start_hour = first_step.hour
+
         plan = mpc.solve(
             model=model,
             t0=indoor,
@@ -472,6 +483,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             comfort_max=comfort_max,
             w_comfort=w_comfort,
             w_energy=w_energy,
+            start_hour=start_hour,
         )
 
         # Honest summer / no-authority behaviour: if the room free-floats above the
@@ -555,7 +567,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         for zone_id, core in self._zones.items():
             if core.model is not None:
                 model = replace(
-                    core.model, bias=float(np.clip(core.bias, -0.5, 0.5))
+                    core.model, hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5)
                 )
             else:
                 model = core.rls.to_model()
@@ -578,5 +590,5 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             core.hold_setpoint = None
             core.model = None
             core.buffer = []
-            core.bias = 0.0
+            core.hourly_bias = np.zeros(24)
             self.store.clear_zone(zone_id)

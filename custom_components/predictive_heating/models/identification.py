@@ -28,6 +28,7 @@ from ..const import (
     GRADUATED_THRESHOLD_HIGH,
     GRADUATED_THRESHOLD_LOW,
     GRADUATED_WINDOW,
+    N_HOURS,
     N_PARAMS_ENHANCED,
     N_PARAMS_STANDARD,
 )
@@ -84,10 +85,13 @@ def _build_matrices(
 
     ``Phi`` rows are the appropriate regressor for the model type, and ``y``
     is the temperature change ``indoor_next - indoor``.
+    Samples may have 5 elements ``(indoor, t_out, sol, u, nxt)`` or 6 elements
+    (with trailing hour-of-day, which is ignored for matrix building).
     """
     phi_rows = []
     y_vals = []
-    for i, (indoor, t_out, sol, u, nxt) in enumerate(samples):
+    for i, sample in enumerate(samples):
+        indoor, t_out, sol, u, nxt = sample[:5]
         prev_delta = 0.0
         if model_type == "enhanced" and i > 0:
             prev_delta = samples[i - 1][4] - samples[i - 1][0]
@@ -109,6 +113,35 @@ def _weighted_ridge(
     except np.linalg.LinAlgError:
         theta, *_ = np.linalg.lstsq(amat, bvec, rcond=None)
         return theta
+
+
+def _compute_hourly_bias(
+    samples: list[tuple], theta: np.ndarray, model_type: str = "standard"
+) -> np.ndarray:
+    """Compute initial 24-element hourly bias from per-hour median residuals.
+
+    Each sample is ``(indoor, t_out, sol, u, nxt[, hour])``. The residual
+    ``(nxt - indoor) - phi @ theta`` is grouped by hour of day, and the median
+    of each hour's residuals becomes the initial bias for that hour.
+    """
+    hourly_residuals: list[list[float]] = [[] for _ in range(N_HOURS)]
+    for i, sample in enumerate(samples):
+        indoor, t_out, sol, u, nxt = sample[:5]
+        prev_delta = 0.0
+        if model_type == "enhanced" and i > 0:
+            prev_delta = samples[i - 1][4] - samples[i - 1][0]
+        phi = _build_regressor(indoor, t_out, sol, u, model_type, prev_delta)
+        pred_delta = float(phi @ theta)
+        residual = (nxt - indoor) - pred_delta
+        hour = int(sample[5]) if len(sample) >= 6 else 0
+        if 0 <= hour < N_HOURS:
+            hourly_residuals[hour].append(residual)
+
+    hourly_bias = np.zeros(N_HOURS, dtype=float)
+    for h in range(N_HOURS):
+        if hourly_residuals[h]:
+            hourly_bias[h] = float(np.median(hourly_residuals[h]))
+    return hourly_bias
 
 
 def batch_fit(
@@ -188,21 +221,20 @@ def batch_fit(
         theta[c] = theta_sub[i]
     theta = _clip_params(theta, n_params)
 
-    # One-step RMSE on the original targets, plus a robust seed for the bias.
+    # One-step RMSE and per-hour bias initialisation.
     phi_full, y_full = _build_matrices(samples, model_type)
     residuals = y_full - phi_full @ theta
-    bias = float(np.median(residuals)) if len(residuals) else 0.0
-    bias = float(np.clip(bias, -0.5, 0.5))
     rmse = (
-        float(np.sqrt(np.mean((residuals - bias) ** 2))) if len(residuals) else None
+        float(np.sqrt(np.mean(residuals**2))) if len(residuals) else None
     )
+    hourly_bias = _compute_hourly_bias(samples, theta, model_type)
     return RCModel(
         params=theta,
         rmse=rmse,
         n_samples=len(samples),
         step_minutes=step_minutes,
         model_type=model_type,
-        bias=bias,
+        hourly_bias=hourly_bias,
     )
 
 
