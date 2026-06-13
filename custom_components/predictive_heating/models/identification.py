@@ -31,8 +31,10 @@ from ..const import (
     N_HOURS,
     N_PARAMS_ENHANCED,
     N_PARAMS_STANDARD,
+    N_PARAMS_3R2C,
 )
 from .rc_model import DEFAULT_PARAMS, DEFAULT_PARAMS_ENHANCED, N_PARAMS, RCModel
+from .rc_model_3r2c import DEFAULT_PARAMS_3R2C, RCModel3R2C
 
 # Bounds keep identified parameters physically sane and the model stable.
 # Order -- standard: [ka, ks, kh, kg]
@@ -75,6 +77,8 @@ def _build_regressor(indoor, t_out, sol, u, model_type="standard", prev_delta=0.
     """Build a difference-form regressor row."""
     if model_type == "enhanced":
         return np.array([t_out - indoor, sol, u, 1.0, prev_delta], dtype=float)
+    if model_type == "3r2c":
+        raise ValueError("_build_regressor does not support 3r2c (use batch_fit_3r2c)")
     return np.array([t_out - indoor, sol, u, 1.0], dtype=float)
 
 
@@ -123,7 +127,13 @@ def _compute_hourly_bias(
     Each sample is ``(indoor, t_out, sol, u, nxt[, hour])``. The residual
     ``(nxt - indoor) - phi @ theta`` is grouped by hour of day, and the median
     of each hour's residuals becomes the initial bias for that hour.
+
+    .. note::
+       This function does **not** support ``model_type="3r2c"``; the 3R2C
+       fit computes its hourly bias inline in :func:`batch_fit_3r2c`.
     """
+    if model_type == "3r2c":
+        raise ValueError("_compute_hourly_bias: use inline bias in batch_fit_3r2c")
     hourly_residuals: list[list[float]] = [[] for _ in range(N_HOURS)]
     for i, sample in enumerate(samples):
         indoor, t_out, sol, u, nxt = sample[:5]
@@ -364,5 +374,156 @@ class RecursiveLeastSquares:
             rmse=self.rmse,
             n_samples=n_samples or self._count,
             step_minutes=step_minutes,
-            bias=self.bias,
+            hourly_bias=np.full(N_HOURS, self.bias),
         )
+
+
+# ---------------------------------------------------------------------------
+# 3R2C (two-node) identification
+# ---------------------------------------------------------------------------
+# Bounds for the 6-parameter 3R2C model.
+PARAM_LOWER_3R2C = np.array([0.005, 0.0, 0.0, -2.0, 0.001, 0.001], dtype=float)
+PARAM_UPPER_3R2C = np.array([0.50, 2.0, 1.0, 4.0, 0.50, 0.50], dtype=float)
+
+# Default wall-to-air heat-capacity ratio (C_w / C_a).  k_wa = k_aw / C_RATIO.
+# Heavier slabs -> larger ratio; 4.0 is reasonable for a concrete floor.
+C_RATIO_3R2C = 4.0
+
+
+def _forward_filter_tw(
+    samples: list[tuple], k_wa: float = 0.02
+) -> np.ndarray:
+    """Forward-filter an estimate of the wall temperature from data.
+
+    Returns an array of T_w values aligned with the start of each sample
+    transition.  T_w is updated as::
+
+        T_w[k+1] = T_w[k] + k_wa * (T_a[k] - T_w[k])
+
+    where k_wa is an initial guess (refined in the second step).
+    """
+    n = len(samples)
+    tw = np.empty(n + 1, dtype=float)
+    if n == 0:
+        return tw
+    # Initialise T_w from the first indoor temperature (equilibrium assumption).
+    tw[0] = samples[0][0]
+    for i in range(n):
+        ta = samples[i][0]
+        tw[i + 1] = tw[i] + k_wa * (ta - tw[i])
+    return tw
+
+
+def batch_fit_3r2c(
+    samples: list[tuple],
+    step_minutes: float = 30.0,
+    ridge: float = 1e-2,
+    irls_iters: int = 5,
+) -> RCModel3R2C:
+    """Fit a 3R2C two-node model from samples.
+
+    Two-step procedure (cf. Lin et al. 2024):
+
+    1. Forward-filter T_w from the data using an initial k_wa guess.
+    2. Fit [ka, ks, kh, kg, k_aw] via Huber/IRLS ridge regression (T_a delta).
+    3. Re-estimate k_wa from the wall-update equation using the fitted T_w.
+
+    Returns an :class:`RCModel3R2C` with all 6 params + hourly bias.
+    """
+    prior = DEFAULT_PARAMS_3R2C.copy()
+    n_params = N_PARAMS_3R2C
+
+    if len(samples) < n_params + 1:
+        return RCModel3R2C(
+            params=prior.copy(), rmse=None, n_samples=len(samples),
+            step_minutes=step_minutes,
+        )
+
+    # ---- Step 1: initial T_w estimation ----
+    k_wa_guess = prior[5]  # default k_wa = 0.02
+    tw = _forward_filter_tw(samples, k_wa=k_wa_guess)
+
+    # ---- Step 2: fit air-node params [ka, ks, kh, kg, k_aw] ----
+    # Regressor for air delta: [t_out - indoor, sol, u, 1.0, tw - indoor]
+    phi_rows = []
+    y_vals = []
+    for i, sample in enumerate(samples):
+        indoor, t_out, sol, u, nxt = sample[:5]
+        phi_rows.append(np.array([
+            t_out - indoor, sol, u, 1.0, tw[i] - indoor,
+        ], dtype=float))
+        y_vals.append(nxt - indoor)
+    phi = np.array(phi_rows, dtype=float)
+    y = np.array(y_vals, dtype=float)
+
+    # Excitation guards (cols: 0=ka, 1=ks, 2=kh, 3=kg, 4=k_aw).
+    sol_col = phi[:, 1]
+    u_col = phi[:, 2]
+    fit_sol = float(np.std(sol_col)) >= EXCITATION_SOL_STD
+    fit_heat = float(np.std(u_col)) >= EXCITATION_U_STD
+
+    cols = [0, 3, 4]  # ka, kg, k_aw are always fitted
+    if fit_sol:
+        cols.append(1)  # ks
+    if fit_heat:
+        cols.append(2)  # kh
+    else:
+        y = y - prior[2] * u_col
+    cols = sorted(cols)
+
+    phi_sub = phi[:, cols]
+    prior_sub = prior[cols].copy()
+    if fit_sol:
+        sol_idx = cols.index(1)
+        prior_sub[sol_idx] = 0.0
+
+    w = np.ones(len(y), dtype=float)
+    theta_sub = prior_sub.copy()
+    for _ in range(max(1, irls_iters)):
+        theta_sub = _weighted_ridge(phi_sub, y, w, ridge, prior_sub)
+        resid = y - phi_sub @ theta_sub
+        scale = 1.4826 * np.median(np.abs(resid - np.median(resid))) + 1e-6
+        delta = max(HUBER_DELTA, scale)
+        a = np.abs(resid)
+        w = np.where(a <= delta, 1.0, delta / np.maximum(a, 1e-9))
+
+    theta = prior.copy()
+    for i, c in enumerate(cols):
+        theta[c] = theta_sub[i]
+
+    # ---- Step 3: estimate k_wa from wall dynamics ----
+    # Re-filter T_w with the newly fitted k_aw (use k_wa = k_aw / C_RATIO)
+    k_aw_hat = theta[4]
+    k_wa_val = float(np.clip(k_aw_hat / C_RATIO_3R2C, 0.001, 0.50))
+    theta[5] = k_wa_val
+
+    # Clip all params.
+    theta = np.clip(theta, PARAM_LOWER_3R2C, PARAM_UPPER_3R2C)
+
+    # Re-filter T_w with the final k_wa for consistent model initialisation.
+    tw_final = _forward_filter_tw(samples, k_wa=theta[5])
+    tw_last = float(tw_final[-1])
+
+    # One-step RMSE and per-hour bias initialisation.
+    residuals = y - (phi[:, :5] @ theta[:5])
+    rmse = float(np.sqrt(np.mean(residuals**2))) if len(residuals) else None
+
+    # Hourly bias from per-hour median residuals (inline to avoid regressor mismatch).
+    hourly_residuals: list[list[float]] = [[] for _ in range(N_HOURS)]
+    for i in range(len(samples)):
+        hour = int(samples[i][5]) if len(samples[i]) >= 6 else 0
+        if 0 <= hour < N_HOURS:
+            hourly_residuals[hour].append(float(residuals[i]))
+    hourly_bias = np.zeros(N_HOURS, dtype=float)
+    for h in range(N_HOURS):
+        if hourly_residuals[h]:
+            hourly_bias[h] = float(np.median(hourly_residuals[h]))
+
+    return RCModel3R2C(
+        params=theta,
+        rmse=rmse,
+        n_samples=len(samples),
+        step_minutes=step_minutes,
+        hourly_bias=hourly_bias,
+        tw=tw_last,
+    )

@@ -62,7 +62,8 @@ DEFAULT_MODEL_TYPE = "standard"
 # Model types
 MODEL_STANDARD = "standard"
 MODEL_ENHANCED = "enhanced"
-MODEL_TYPES = [MODEL_STANDARD, MODEL_ENHANCED]
+MODEL_3R2C = "3r2c"
+MODEL_TYPES = [MODEL_STANDARD, MODEL_ENHANCED, MODEL_3R2C]
 
 # Plausible indoor/setpoint temperature band (deg C). Readings outside this range
 # are treated as sensor faults (e.g. the 327.67 C sentinel some ESPHome/Wavin
@@ -144,6 +145,7 @@ DEFAULT_K_MEM = 0.15
 # Number of parameters in each model type.
 N_PARAMS_STANDARD = 4  # [ka, ks, kh, kg]
 N_PARAMS_ENHANCED = 5  # [ka, ks, kh, kg, k_mem]
+N_PARAMS_3R2C = 6  # [ka, ks, kh, kg, k_aw, k_wa] for 3R2C two-node model
 
 # Hourly bias (time-varying internal gains schedule).
 # Number of hours in a day for the per-hour bias array.

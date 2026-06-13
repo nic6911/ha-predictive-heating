@@ -78,7 +78,9 @@ from .forecast import (
     async_get_weather_forecast,
     solar_proxy,
 )
-from .models.identification import BIAS_ALPHA, RecursiveLeastSquares, batch_fit
+from .const import MODEL_3R2C
+from .models.identification import BIAS_ALPHA, RecursiveLeastSquares, batch_fit, batch_fit_3r2c
+from .models.rc_model_3r2c import RCModel3R2C
 from .models.rc_model import RCModel
 from .storage import ModelStore
 
@@ -132,10 +134,12 @@ class _ZoneCore:
     hold_setpoint: float | None = None
     # Stable model used for forecasting/control: the robust batch fit, periodically
     # re-identified from ``buffer`` (NOT the wandering online RLS).
-    model: RCModel | None = None
+    model: RCModel | RCModel3R2C | None = None
     buffer: list = field(default_factory=list)  # rows: [indoor, t_out, sol, u, next, hour]
     # Online time-varying output-disturbance correction (deg C / step, per hour).
     hourly_bias: np.ndarray = field(default_factory=lambda: np.zeros(24))
+    # Wall temperature for 3R2C model (deg C), otherwise 0.
+    tw: float = 0.0
     # Observation anchoring the next *step-spaced* buffer transition. Buffer samples
     # are formed at ~``step_minutes`` spacing (a uniform grid) regardless of the
     # faster control-update cadence, so the batch fit sees consistent-interval data.
@@ -198,6 +202,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 model=model,
                 buffer=[list(row) for row in self.store.get_buffer(zone_id)],
                 hourly_bias=model.hourly_bias.copy() if (model is not None and model.hourly_bias is not None) else np.zeros(24),
+                tw=model.tw if (model is not None and hasattr(model, 'tw')) else 0.0,
             )
 
     def zone_param(self, zone_id: str, key: str, default):
@@ -394,9 +399,14 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 # multi-step open-loop forecast captures diurnal occupancy pattern
                 # (Lin et al., 2024, two-step identification).
                 if core.model is not None:
-                    phi_lb = core.model.regressor(
-                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"]
-                    )
+                    if hasattr(core.model, 'tw'):
+                        phi_lb = core.model.regressor(
+                            lb["indoor"], lb["t_out"], lb["sol"], lb["u"], tw=core.tw,
+                        )
+                    else:
+                        phi_lb = core.model.regressor(
+                            lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
+                        )
                     r = (indoor - lb["indoor"]) - float(phi_lb @ core.model.params)
                     if abs(r) <= OUTLIER_ABS_CAP and 0 <= hour < 24:
                         core.hourly_bias[hour] = (
@@ -404,6 +414,14 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                             + HBIAS_ALPHA * r
                         )
                         core.hourly_bias = np.clip(core.hourly_bias, -0.5, 0.5)
+                    # Update wall temperature for 3R2C model.
+                    if hasattr(core.model, 'tw'):
+                        core.model.tw = core.tw
+                        core.model.step(
+                            lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
+                            hour=hour,
+                        )
+                        core.tw = core.model.tw
                 core.last_buffer_obs = None  # consumed -> re-anchor below
             if core.last_buffer_obs is None:
                 core.last_buffer_obs = {
@@ -428,12 +446,19 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         ):
             first_fit = core.model is None
             model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
-            core.model = batch_fit(
-                core.buffer, step_minutes=step_min, model_type=model_type
-            )
+            if model_type == MODEL_3R2C:
+                core.model = batch_fit_3r2c(
+                    core.buffer, step_minutes=step_min,
+                )
+            else:
+                core.model = batch_fit(
+                    core.buffer, step_minutes=step_min, model_type=model_type
+                )
             if first_fit:
                 # Seed the online hourly bias from the batch fit.
                 core.hourly_bias = core.model.hourly_bias.copy()
+                if hasattr(core.model, 'tw'):
+                    core.tw = core.model.tw
 
         # Record this observation for next cycle's learning / detection.
         if indoor is not None and current_setpoint is not None:
@@ -448,7 +473,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         # Fall back to the RLS estimate only at cold start before the first
         # batch refit exists.
         if core.model is not None:
-            model = replace(core.model, hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5))
+            kwargs = dict(hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5))
+            if hasattr(core.model, 'tw'):
+                kwargs['tw'] = core.tw
+            model = replace(core.model, **kwargs)
         else:
             model = core.rls.to_model(step_minutes=step_min)
         result.fit_rmse = model.rmse
@@ -566,9 +594,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
     async def _persist(self) -> None:
         for zone_id, core in self._zones.items():
             if core.model is not None:
-                model = replace(
-                    core.model, hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5)
-                )
+                kwargs = dict(hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5))
+                if hasattr(core.model, 'tw'):
+                    kwargs['tw'] = core.tw
+                model = replace(core.model, **kwargs)
             else:
                 model = core.rls.to_model()
             self.store.set_model(zone_id, model)
@@ -591,4 +620,5 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             core.model = None
             core.buffer = []
             core.hourly_bias = np.zeros(24)
+            core.tw = 0.0
             self.store.clear_zone(zone_id)

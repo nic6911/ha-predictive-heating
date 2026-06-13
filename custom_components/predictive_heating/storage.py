@@ -5,8 +5,9 @@ from __future__ import annotations
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import STORAGE_KEY, STORAGE_VERSION
+from .const import MODEL_3R2C, STORAGE_KEY, STORAGE_VERSION
 from .models.rc_model import RCModel
+from .models.rc_model_3r2c import RCModel3R2C
 
 
 class ModelStore:
@@ -22,9 +23,13 @@ class ModelStore:
             self._data = loaded
         self._data.setdefault("zones", {})
 
-    def get_model(self, zone_id: str) -> RCModel | None:
+    def get_model(self, zone_id: str) -> RCModel | RCModel3R2C | None:
         raw = self._data["zones"].get(zone_id, {}).get("model")
-        return RCModel.from_dict(raw) if raw else None
+        if not raw:
+            return None
+        if raw.get("model_type") == MODEL_3R2C:
+            return RCModel3R2C.from_dict(raw)
+        return RCModel.from_dict(raw)
 
     def get_buffer(self, zone_id: str) -> list[list[float]]:
         return list(self._data["zones"].get(zone_id, {}).get("buffer", []))

@@ -25,11 +25,12 @@ from .const import (
     DEFAULT_MODEL_TYPE,
     DEFAULT_STEP_MINUTES,
     DOMAIN,
+    MODEL_3R2C,
     PLAUSIBLE_TEMP_MAX,
     PLAUSIBLE_TEMP_MIN,
 )
 from .forecast import clear_sky_index
-from .models.identification import RecursiveLeastSquares, batch_fit
+from .models.identification import RecursiveLeastSquares, batch_fit, batch_fit_3r2c
 from .models.rc_model import RCModel
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,7 +197,10 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         samples.append((indoor[k], t_out, sol, u, indoor[k + 1], hour))
 
     model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
-    model = batch_fit(samples, step_minutes=step_min, model_type=model_type)
+    if model_type == MODEL_3R2C:
+        model = batch_fit_3r2c(samples, step_minutes=step_min)
+    else:
+        model = batch_fit(samples, step_minutes=step_min, model_type=model_type)
     zone_id = cfg[CONF_ZONE_ID]
     core = coordinator._zones.get(zone_id)
     if core is not None:
@@ -213,6 +217,8 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         core.model = model
         core.buffer = [list(s) for s in samples]
         core.hourly_bias = model.hourly_bias.copy()
+        if hasattr(model, 'tw'):
+            core.tw = model.tw
     coordinator.store.set_model(zone_id, model)
     coordinator.store.set_buffer(zone_id, [list(s) for s in samples])
     _LOGGER.info(
