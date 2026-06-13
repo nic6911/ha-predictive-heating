@@ -16,15 +16,15 @@ from .const import (
     CONF_COMFORT_MAX,
     CONF_COMFORT_MIN,
     CONF_COMFORT_TARGET,
+    CONF_MODEL_TYPE,
     CONF_OUTDOOR_SENSOR,
     CONF_STEP_MINUTES,
     CONF_TEMP_SENSOR,
     CONF_WEATHER_ENTITY,
     CONF_ZONE_ID,
+    DEFAULT_MODEL_TYPE,
     DEFAULT_STEP_MINUTES,
     DOMAIN,
-    OUTLIER_ABS_CAP,
-    OUTLIER_SIGMA,
     PLAUSIBLE_TEMP_MAX,
     PLAUSIBLE_TEMP_MIN,
 )
@@ -194,14 +194,13 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         sol = clear_sky_index(grid[k], lat, lon)
         samples.append((indoor[k], t_out, sol, u, indoor[k + 1]))
 
-    model = batch_fit(samples, step_minutes=step_min)
+    model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
+    model = batch_fit(samples, step_minutes=step_min, model_type=model_type)
     zone_id = cfg[CONF_ZONE_ID]
     core = coordinator._zones.get(zone_id)
     if core is not None:
         core.rls = RecursiveLeastSquares(
-            params=model.params,
-            outlier_sigma=OUTLIER_SIGMA,
-            outlier_abs_cap=OUTLIER_ABS_CAP,
+            params=model.params[:4] if len(model.params) >= 4 else None,
             bias=model.bias,
         )
         core.last_obs = None

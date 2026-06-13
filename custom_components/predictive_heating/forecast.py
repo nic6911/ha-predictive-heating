@@ -161,6 +161,28 @@ def _extract_price_points(state) -> tuple[list[datetime], list[float]]:
     return times, values
 
 
+async def async_get_co2_forecast(
+    hass: HomeAssistant,
+    co2_entity: str | None,
+    n: int,
+) -> np.ndarray:
+    """Return a CO2 intensity forecast array of length ``n`` (g/kWh).
+
+    Uses the current sensor reading as a flat forecast (CO2 intensity is slow-varying).
+    Returns zeros if no CO2 entity is configured or unavailable.
+    """
+    if not co2_entity:
+        return np.zeros(n, dtype=float)
+    state = hass.states.get(co2_entity)
+    if state is None:
+        return np.zeros(n, dtype=float)
+    try:
+        val = float(state.state)
+    except (TypeError, ValueError):
+        return np.zeros(n, dtype=float)
+    return np.full(n, max(0.0, val), dtype=float)
+
+
 async def async_get_price_forecast(
     hass: HomeAssistant,
     price_entity: str | None,

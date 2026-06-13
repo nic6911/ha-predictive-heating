@@ -17,12 +17,14 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_CLIMATE_ENTITY,
     CONF_CO2_ENTITY,
+    CONF_CO2_OPTIMIZE,
     CONF_COMFORT_MAX,
     CONF_COMFORT_MIN,
     CONF_COMFORT_TARGET,
     CONF_HORIZON_HOURS,
     CONF_IRRADIANCE_SENSOR,
     CONF_MODE,
+    CONF_MODEL_TYPE,
     CONF_OUTDOOR_SENSOR,
     CONF_PRICE_ENTITY,
     CONF_PRICE_OPTIMIZE,
@@ -37,14 +39,17 @@ from .const import (
     DEFAULT_COMFORT_MAX,
     DEFAULT_COMFORT_MIN,
     DEFAULT_COMFORT_TARGET,
+    DEFAULT_CO2_OPTIMIZE,
     DEFAULT_HORIZON_HOURS,
     DEFAULT_MODE,
+    DEFAULT_MODEL_TYPE,
     DEFAULT_PRICE_OPTIMIZE,
     DEFAULT_STEP_MINUTES,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     MAX_ZONES,
     MODES,
+    MODEL_TYPES,
     ZONE_MODE_AUTO,
     ZONE_MODES,
 )
@@ -88,6 +93,10 @@ def _global_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(
                 CONF_PRICE_OPTIMIZE,
                 default=defaults.get(CONF_PRICE_OPTIMIZE, DEFAULT_PRICE_OPTIMIZE),
+            ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_CO2_OPTIMIZE,
+                default=defaults.get(CONF_CO2_OPTIMIZE, DEFAULT_CO2_OPTIMIZE),
             ): selector.BooleanSelector(),
             vol.Optional(
                 CONF_MODE, default=defaults.get(CONF_MODE, DEFAULT_MODE)
@@ -168,6 +177,12 @@ def _zone_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(
                 CONF_ZONE_ENABLED, default=defaults.get(CONF_ZONE_ENABLED, True)
             ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_MODEL_TYPE,
+                default=defaults.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=MODEL_TYPES, translation_key="model_type")
+            ),
         }
     )
 

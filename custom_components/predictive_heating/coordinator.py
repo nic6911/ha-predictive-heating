@@ -27,14 +27,19 @@ from homeassistant.util import dt as dt_util
 
 from . import climate_io
 from .const import (
+    BUFFER_DAYS,
+    CO2_BASELINE,
+    CO2_SCALE,
     CONF_CLIMATE_ENTITY,
     CONF_CO2_ENTITY,
+    CONF_CO2_OPTIMIZE,
     CONF_COMFORT_MAX,
     CONF_COMFORT_MIN,
     CONF_COMFORT_TARGET,
     CONF_HORIZON_HOURS,
     CONF_IRRADIANCE_SENSOR,
     CONF_MODE,
+    CONF_MODEL_TYPE,
     CONF_OUTDOOR_SENSOR,
     CONF_PRICE_ENTITY,
     CONF_PRICE_OPTIMIZE,
@@ -51,23 +56,23 @@ from .const import (
     DEFAULT_COMFORT_TARGET,
     DEFAULT_HORIZON_HOURS,
     DEFAULT_MODE,
+    DEFAULT_MODEL_TYPE,
     DEFAULT_STEP_MINUTES,
     DEFAULT_UPDATE_INTERVAL,
-    BUFFER_DAYS,
-    REFIT_INTERVAL_HOURS,
-    MIN_REFIT_SAMPLES,
     DISTURBANCE_DROP_MIN,
     DISTURBANCE_DROP_SIGMA,
     DISTURBANCE_HOLD,
     DOMAIN,
     FIT_RMSE_AUTONOMY_THRESHOLD,
+    MIN_REFIT_SAMPLES,
     MODE_WEIGHTS,
     OUTLIER_ABS_CAP,
-    OUTLIER_SIGMA,
+    REFIT_INTERVAL_HOURS,
     ZONE_MODE_ADVISORY,
 )
 from .control import mpc
 from .forecast import (
+    async_get_co2_forecast,
     async_get_price_forecast,
     async_get_weather_forecast,
     solar_proxy,
@@ -179,11 +184,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         for cfg in self._zone_configs():
             zone_id = cfg[CONF_ZONE_ID]
             model = self.store.get_model(zone_id)
-            params = model.params if model else None
+            # RLS always uses 4 params (disturbance detection only).
+            rls_params = model.params[:4] if (model is not None and len(model.params) >= 4) else None
             rls = RecursiveLeastSquares(
-                params=params,
-                outlier_sigma=OUTLIER_SIGMA,
-                outlier_abs_cap=OUTLIER_ABS_CAP,
+                params=rls_params,
                 bias=model.bias if model else 0.0,
             )
             self._zones[zone_id] = _ZoneCore(
@@ -263,6 +267,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
 
         t_out_fc, sol_fc = (np.array([]), np.array([]))
         price_fc = np.array([])
+        co2_entity = self._global(CONF_CO2_ENTITY)
+        co2_enabled = self._global(CONF_CO2_OPTIMIZE, False)
         if weather:
             t_out_fc, sol_fc = await async_get_weather_forecast(
                 self.hass, weather, n, step_min
@@ -270,6 +276,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         price_fc = await async_get_price_forecast(
             self.hass, price_entity, n, step_min
         )
+        if co2_entity and co2_enabled:
+            co2_fc = await async_get_co2_forecast(self.hass, co2_entity, n)
+            price_fc = price_fc * (1.0 + CO2_SCALE * co2_fc / CO2_BASELINE)
 
         results: dict[str, ZoneResult] = {}
         for zone_id, core in self._zones.items():
@@ -381,8 +390,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 # the stable batch model, so the multi-step rollout stays unbiased
                 # under slow drift / model mismatch (Pannocchia & Rawlings, 2003).
                 if core.model is not None:
-                    phi_lb = np.array(
-                        [lb["t_out"] - lb["indoor"], lb["sol"], lb["u"], 1.0]
+                    phi_lb = core.model.regressor(
+                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"]
                     )
                     r = (indoor - lb["indoor"]) - float(phi_lb @ core.model.params)
                     if abs(r) <= OUTLIER_ABS_CAP:
@@ -411,7 +420,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             and len(core.buffer) >= MIN_REFIT_SAMPLES
         ):
             first_fit = core.model is None
-            core.model = batch_fit(core.buffer, step_minutes=step_min)
+            model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
+            core.model = batch_fit(
+                core.buffer, step_minutes=step_min, model_type=model_type
+            )
             if first_fit:
                 # Seed the online bias from the batch median residual once.
                 core.bias = core.model.bias
@@ -559,9 +571,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
     def reset_zone(self, zone_id: str) -> None:
         core = self._zones.get(zone_id)
         if core is not None:
-            core.rls = RecursiveLeastSquares(
-                outlier_sigma=OUTLIER_SIGMA, outlier_abs_cap=OUTLIER_ABS_CAP
-            )
+            core.rls = RecursiveLeastSquares()
             core.last_obs = None
             core.last_buffer_obs = None
             core.disturbance_until = None

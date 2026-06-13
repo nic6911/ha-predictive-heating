@@ -8,6 +8,7 @@
           "weather_entity": "Weather entity",
           "price_entity": "Energy price sensor (optional)",
           "co2_entity": "CO2 intensity sensor (optional)",
+          "co2_optimize": "Enable CO2-aware scheduling",
           "price_optimize": "Enable price-aware scheduling",
           "mode": "Optimization profile",
           "horizon_hours": "Prediction horizon (hours)",
@@ -37,6 +38,7 @@
           "weather_entity": "Weather entity",
           "price_entity": "Energy price sensor (optional)",
           "co2_entity": "CO2 intensity sensor (optional)",
+          "co2_optimize": "Enable CO2-aware scheduling",
           "price_optimize": "Enable price-aware scheduling",
           "mode": "Optimization profile",
           "horizon_hours": "Prediction horizon (hours)",
@@ -56,9 +58,11 @@
           "comfort_target": "Comfort target (°C)",
           "comfort_max": "Comfort maximum (°C)",
           "zone_mode": "Control mode",
-          "enabled": "Enabled"
+          "enabled": "Enabled",
+          "model_type": "Thermal model type"
         },
         "data_description": {
+          "model_type": "Standard (1R1C) for most rooms. Enhanced adds thermal inertia for rooms with thermal mass effects (e.g. large windows, heavy slab floors).",
           "outdoor_sensor": "Optional. A temperature sensor (°C). If omitted, the outdoor temperature from the location-bound weather entity is used.",
           "irradiance_sensor": "Optional. A solar irradiance sensor in W/m² (device class 'irradiance', e.g. from a weather station or Solcast). ~1000 W/m² is treated as full sun. If omitted, a solar-gain estimate is derived automatically from the weather entity's cloud cover and UV index, so you do not need a sensor here."
         }
@@ -88,6 +92,12 @@
       "options": {
         "auto": "Autonomous",
         "advisory": "Advisory only"
+      }
+    },
+    "model_type": {
+      "options": {
+        "standard": "Standard (1R1C)",
+        "enhanced": "Enhanced (with thermal inertia)"
       }
     }
   },
