@@ -78,8 +78,14 @@ from .forecast import (
     async_get_weather_forecast,
     solar_proxy,
 )
-from .const import MODEL_3R2C
-from .models.identification import BIAS_ALPHA, RecursiveLeastSquares, batch_fit, batch_fit_3r2c
+from .const import MODEL_3R2C, MODEL_AUTO
+from .models.identification import (
+    BIAS_ALPHA,
+    RecursiveLeastSquares,
+    batch_fit,
+    batch_fit_3r2c,
+    batch_fit_auto,
+)
 from .models.rc_model_3r2c import RCModel3R2C
 from .models.rc_model import RCModel
 from .storage import ModelStore
@@ -446,7 +452,11 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         ):
             first_fit = core.model is None
             model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
-            if model_type == MODEL_3R2C:
+            if model_type == MODEL_AUTO:
+                core.model = batch_fit_auto(
+                    core.buffer, step_minutes=step_min,
+                )
+            elif model_type == MODEL_3R2C:
                 core.model = batch_fit_3r2c(
                     core.buffer, step_minutes=step_min,
                 )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import MODEL_3R2C, STORAGE_KEY, STORAGE_VERSION
+from .const import MODEL_3R2C, MODEL_AUTO, STORAGE_KEY, STORAGE_VERSION
 from .models.rc_model import RCModel
 from .models.rc_model_3r2c import RCModel3R2C
 
@@ -27,7 +27,7 @@ class ModelStore:
         raw = self._data["zones"].get(zone_id, {}).get("model")
         if not raw:
             return None
-        if raw.get("model_type") == MODEL_3R2C:
+        if raw.get("model_type") in (MODEL_3R2C, MODEL_AUTO):
             return RCModel3R2C.from_dict(raw)
         return RCModel.from_dict(raw)
 

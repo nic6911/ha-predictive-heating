@@ -240,12 +240,18 @@ class RCModel3R2C:
                 hourly_bias = np.full(N_HOURS, data.get("bias", 0.0))
         else:
             hourly_bias = np.full(N_HOURS, data.get("bias", 0.0))
+        loaded_type = str(data.get("model_type", "3r2c"))
+        # Treat auto as a variant of 3r2c with adaptive identification.
+        if loaded_type == "auto":
+            model_type = "auto"
+        else:
+            model_type = "3r2c"
         return cls(
             params=params,
             rmse=data.get("rmse"),
             n_samples=int(data.get("n_samples", 0)),
             step_minutes=float(data.get("step_minutes", 30.0)),
-            model_type="3r2c",
+            model_type=model_type,
             tw=float(data.get("tw", 0.0)),
             hourly_bias=hourly_bias,
         )

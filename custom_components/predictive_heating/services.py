@@ -26,11 +26,17 @@ from .const import (
     DEFAULT_STEP_MINUTES,
     DOMAIN,
     MODEL_3R2C,
+    MODEL_AUTO,
     PLAUSIBLE_TEMP_MAX,
     PLAUSIBLE_TEMP_MIN,
 )
 from .forecast import clear_sky_index
-from .models.identification import RecursiveLeastSquares, batch_fit, batch_fit_3r2c
+from .models.identification import (
+    RecursiveLeastSquares,
+    batch_fit,
+    batch_fit_3r2c,
+    batch_fit_auto,
+)
 from .models.rc_model import RCModel
 
 _LOGGER = logging.getLogger(__name__)
@@ -197,7 +203,9 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         samples.append((indoor[k], t_out, sol, u, indoor[k + 1], hour))
 
     model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
-    if model_type == MODEL_3R2C:
+    if model_type == MODEL_AUTO:
+        model = batch_fit_auto(samples, step_minutes=step_min)
+    elif model_type == MODEL_3R2C:
         model = batch_fit_3r2c(samples, step_minutes=step_min)
     else:
         model = batch_fit(samples, step_minutes=step_min, model_type=model_type)

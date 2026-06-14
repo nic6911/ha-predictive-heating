@@ -527,3 +527,252 @@ def batch_fit_3r2c(
         hourly_bias=hourly_bias,
         tw=tw_last,
     )
+
+
+# ---------------------------------------------------------------------------
+# Auto (adaptive) identification
+# ---------------------------------------------------------------------------
+
+def _compute_effective_ka(
+    indoor: np.ndarray, t_out: np.ndarray, step_minutes: float = 30.0
+) -> float:
+    """Compute effective outdoor coupling ka from the data's attenuation ratio.
+
+    For a first-order thermal system driven by diurnal outdoor temperature
+    variation, the indoor temperature attenuates the outdoor signal by::
+
+        A = indoor_std / outdoor_std ≈ 1 / sqrt(1 + (2π τ / T)²)
+
+    where τ is the building time constant and T = 24 h is the diurnal period.
+    Solving for τ gives::
+
+        τ = T / (2π) * sqrt(1/A² - 1)   (hours)
+
+    then ka = step_hours / τ.
+
+    When the indoor is extremely stable (A → 0) the time constant is very
+    large and ka approaches its lower bound.  When indoor tracks outdoor
+    closely (A → 1) the time constant is very short and ka caps at an upper
+    bound.
+
+    Returns ka clipped to ``[0.005, 0.50]``.
+    """
+    indoor_std = float(np.std(indoor))
+    t_out_std = float(np.std(t_out))
+
+    if t_out_std < 0.1 or indoor_std < 0.01:
+        return 0.02  # fallback for nearly constant data
+
+    A = indoor_std / t_out_std
+    if A >= 0.99:
+        return 0.30
+
+    # Diurnal period (hours).
+    T_hours = 24.0
+    # Time constant from attenuation formula.
+    tau_hours = T_hours / (2.0 * np.pi) * np.sqrt(max(0.0, 1.0 / (A * A) - 1.0))
+    # ka = step_size / time_constant.
+    ka = step_minutes / (60.0 * tau_hours)
+    return float(np.clip(ka, 0.005, 0.50))
+
+
+def _analyze_excitation(
+    indoor: np.ndarray, t_out: np.ndarray, sol: np.ndarray, u: np.ndarray
+) -> dict:
+    """Analyse buffer data and return excitation metrics."""
+    indoor_range = float(np.ptp(indoor))
+    indoor_std = float(np.std(indoor))
+    t_out_std = float(np.std(t_out))
+    coupling_ratio = indoor_std / max(t_out_std, 0.1)
+    return {
+        "indoor_range": indoor_range,
+        "indoor_std": indoor_std,
+        "t_out_std": t_out_std,
+        "coupling_ratio": coupling_ratio,
+    }
+
+
+_EXCITATION_INDOOR_RANGE_STABLE = 0.5
+_EXCITATION_INDOOR_RANGE_MODERATE = 1.5
+_EXCITATION_COUPLING_STABLE = 0.10
+_EXCITATION_COUPLING_MODERATE = 0.25
+
+
+def batch_fit_auto(
+    samples: list[tuple],
+    step_minutes: float = 30.0,
+    ridge: float = 1e-2,
+    irls_iters: int = 5,
+) -> RCModel3R2C:
+    """Adaptive 3R2C identification with data-informed priors and column selection.
+
+    The routine analyses the buffer data and picks an identification strategy
+    that matches the room's excitation level:
+
+    * **Stable** (indoor range < 0.5 °C or coupling ratio < 0.10):
+      Only ``kg`` and the hourly bias are fitted.  ``ka``, ``k_aw`` and
+      ``k_wa`` are set from the data-derived attenuation estimate.  This
+      prevents the model from overestimating outdoor coupling in well-insulated
+      rooms, which is the #1 cause of wrong forecasts.
+
+    * **Moderate** (indoor range < 1.5 °C or coupling ratio < 0.25):
+      ``ka`` and ``kg`` are fitted with data-informed priors.  Wall params
+      (k_aw, k_wa) are held at priors derived from ka.
+
+    * **Well-excited** (otherwise): Full 6-param fit with the standard
+      two-step procedure, retaining the existing excitation guards for ks, kh.
+      This path is identical to the original 3R2C identification but uses the
+      attenuation-based ka as the prior.
+
+    Returns an :class:`RCModel3R2C` with ``model_type="auto"``.
+    """
+    prior = DEFAULT_PARAMS_3R2C.copy()
+    n_params = N_PARAMS_3R2C
+
+    if len(samples) < n_params + 1:
+        return RCModel3R2C(
+            params=prior.copy(), rmse=None, n_samples=len(samples),
+            step_minutes=step_minutes, model_type="auto",
+        )
+
+    # ---- Step 1: data analysis ----
+    indoor = np.array([s[0] for s in samples], dtype=float)
+    t_out = np.array([s[1] for s in samples], dtype=float)
+    sol = np.array([s[2] for s in samples], dtype=float)
+    u = np.array([s[3] for s in samples], dtype=float)
+    y = np.array([samples[i][4] - indoor[i] for i in range(len(samples))], dtype=float)
+
+    analysis = _analyze_excitation(indoor, t_out, sol, u)
+    ka_eff = _compute_effective_ka(indoor, t_out, step_minutes)
+    kg_eff = ka_eff * float(np.mean(indoor - t_out))
+    kg_eff = float(np.clip(kg_eff, -2.0, 4.0))
+
+    # Adaptive priors from data characteristics.
+    adaptive_prior = np.array([
+        ka_eff,              # ka: from attenuation
+        0.15,                # ks: moderate solar gain
+        0.20,                # kh: heating effectiveness
+        kg_eff,              # kg: steady-state offset
+        ka_eff * 3.0,        # k_aw: wall coupling proportional to ka
+        ka_eff * 0.75,       # k_wa: k_aw / C_ratio
+    ], dtype=float)
+    adaptive_prior = np.clip(adaptive_prior, PARAM_LOWER_3R2C, PARAM_UPPER_3R2C)
+
+    # Determine excitation regime and select columns to fit.
+    is_stable = (
+        analysis["indoor_range"] < _EXCITATION_INDOOR_RANGE_STABLE
+        or analysis["coupling_ratio"] < _EXCITATION_COUPLING_STABLE
+    )
+    is_moderate = not is_stable and (
+        analysis["indoor_range"] < _EXCITATION_INDOOR_RANGE_MODERATE
+        or analysis["coupling_ratio"] < _EXCITATION_COUPLING_MODERATE
+    )
+
+    if is_stable:
+        # Very stable room: fit only kg + hourly bias.
+        # All thermal structure params are held at adaptive priors.
+        fit_cols = [3]
+        ridge_actual = ridge * 10.0
+        n_iterations = 1
+    elif is_moderate:
+        # Moderately stable: fit ka and kg; hold wall params at priors.
+        fit_cols = [0, 3]
+        ridge_actual = ridge * 3.0
+        n_iterations = 2
+    else:
+        # Well-excited: standard fit with excitation guards for ks, kh.
+        fit_cols = [0, 3, 4]
+        if float(np.std(sol)) >= EXCITATION_SOL_STD:
+            fit_cols.append(1)
+        if float(np.std(u)) >= EXCITATION_U_STD:
+            fit_cols.append(2)
+        else:
+            y = y - adaptive_prior[2] * u
+        ridge_actual = ridge
+        n_iterations = 3
+
+    fit_cols = sorted(fit_cols)
+    theta = adaptive_prior.copy()
+
+    # ---- Iterative two-step identification ----
+    # Forward-filter tw with current k_wa → fit air params → re-estimate k_wa.
+    tw = _forward_filter_tw(samples, k_wa=theta[5])
+
+    for iteration in range(n_iterations):
+        # Build 5-col regressor: [t_out-indoor, sol, u, 1.0, tw-indoor].
+        phi = np.zeros((len(samples), 5), dtype=float)
+        phi[:, 0] = t_out - indoor
+        phi[:, 1] = sol
+        phi[:, 2] = u
+        phi[:, 3] = 1.0
+        phi[:, 4] = tw[:len(samples)] - indoor  # tw[i] is wall temp at step i start
+
+        # Adjust the target for params NOT being fitted in this iteration.
+        # Unfitted params are held at their adaptive priors, so we subtract
+        # their contribution from y (same as the heating-excitation guard).
+        y_adj = y.copy()
+        for c in range(5):
+            if c not in fit_cols and c < len(adaptive_prior):
+                y_adj -= adaptive_prior[c] * phi[:, c]
+
+        # Subset regressor to the columns actually being fitted.
+        phi_sub = phi[:, fit_cols]
+        prior_sub = adaptive_prior[fit_cols].copy()
+
+        # IRLS ridge regression.
+        w = np.ones(len(y_adj), dtype=float)
+        theta_sub = prior_sub.copy()
+        for _ in range(max(1, irls_iters)):
+            theta_sub = _weighted_ridge(phi_sub, y_adj, w, ridge_actual, prior_sub)
+            resid = y_adj - phi_sub @ theta_sub
+            scale = 1.4826 * np.median(np.abs(resid - np.median(resid))) + 1e-6
+            delta = max(HUBER_DELTA, scale)
+            a = np.abs(resid)
+            w = np.where(a <= delta, 1.0, delta / np.maximum(a, 1e-9))
+
+        # Write fitted values back into theta.
+        for i, c in enumerate(fit_cols):
+            theta[c] = theta_sub[i]
+
+        # Derive k_wa from k_aw (heat-capacity ratio).
+        theta[5] = float(np.clip(theta[4] / C_RATIO_3R2C, 0.001, 0.50))
+
+        # Re-filter tw for the next iteration (unless this is the last).
+        if iteration < n_iterations - 1:
+            tw = _forward_filter_tw(samples, k_wa=theta[5])
+
+    # Final clip and tw.
+    theta = np.clip(theta, PARAM_LOWER_3R2C, PARAM_UPPER_3R2C)
+    tw_final = _forward_filter_tw(samples, k_wa=theta[5])
+    tw_last = float(tw_final[-1])
+
+    # Residuals on the full 5-col regressor.
+    phi_final = np.zeros((len(samples), 5), dtype=float)
+    phi_final[:, 0] = t_out - indoor
+    phi_final[:, 1] = sol
+    phi_final[:, 2] = u
+    phi_final[:, 3] = 1.0
+    phi_final[:, 4] = tw_final[:len(samples)] - indoor
+    resids = y - (phi_final @ theta[:5])
+    rmse = float(np.sqrt(np.mean(resids ** 2))) if len(resids) else None
+
+    # Hourly bias from per-hour median residuals.
+    hourly_residuals: list[list[float]] = [[] for _ in range(N_HOURS)]
+    for i in range(len(samples)):
+        hour = int(samples[i][5]) if len(samples[i]) >= 6 else 0
+        if 0 <= hour < N_HOURS:
+            hourly_residuals[hour].append(float(resids[i]))
+    hourly_bias = np.zeros(N_HOURS, dtype=float)
+    for h in range(N_HOURS):
+        if hourly_residuals[h]:
+            hourly_bias[h] = float(np.median(hourly_residuals[h]))
+
+    return RCModel3R2C(
+        params=theta,
+        rmse=rmse,
+        n_samples=len(samples),
+        step_minutes=step_minutes,
+        model_type="auto",
+        hourly_bias=hourly_bias,
+        tw=tw_last,
+    )

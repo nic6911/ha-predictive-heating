@@ -63,7 +63,8 @@ DEFAULT_MODEL_TYPE = "standard"
 MODEL_STANDARD = "standard"
 MODEL_ENHANCED = "enhanced"
 MODEL_3R2C = "3r2c"
-MODEL_TYPES = [MODEL_STANDARD, MODEL_ENHANCED, MODEL_3R2C]
+MODEL_AUTO = "auto"
+MODEL_TYPES = [MODEL_STANDARD, MODEL_ENHANCED, MODEL_3R2C, MODEL_AUTO]
 
 # Plausible indoor/setpoint temperature band (deg C). Readings outside this range
 # are treated as sensor faults (e.g. the 327.67 C sentinel some ESPHome/Wavin
