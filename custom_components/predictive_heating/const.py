@@ -57,14 +57,7 @@ DEFAULT_COMFORT_MAX = 23.0
 DEFAULT_COMFORT_TARGET = 21.0
 DEFAULT_PRICE_OPTIMIZE = False
 DEFAULT_CO2_OPTIMIZE = False
-DEFAULT_MODEL_TYPE = "standard"
-
-# Model types
-MODEL_STANDARD = "standard"
-MODEL_ENHANCED = "enhanced"
-MODEL_3R2C = "3r2c"
 MODEL_AUTO = "auto"
-MODEL_TYPES = [MODEL_STANDARD, MODEL_ENHANCED, MODEL_3R2C, MODEL_AUTO]
 
 # Plausible indoor/setpoint temperature band (deg C). Readings outside this range
 # are treated as sensor faults (e.g. the 327.67 C sentinel some ESPHome/Wavin
@@ -136,17 +129,8 @@ DISTURBANCE_DROP_MIN = 0.5  # deg C; minimum drop-below-prediction to flag
 # for at least this long, or until the temperature recovers.
 DISTURBANCE_HOLD = timedelta(minutes=60)
 
-# Thermal-inertia (enhanced) model -- adds one parameter k_mem that captures
-# the slab/floor thermal-mass effect: if the room was warming last step it
-# tends to continue warming. Bounded to [0, 0.9] for stability.
-PARAM_MEM_LOWER = 0.0
-PARAM_MEM_UPPER = 0.9
-DEFAULT_K_MEM = 0.15
-
-# Number of parameters in each model type.
-N_PARAMS_STANDARD = 4  # [ka, ks, kh, kg]
-N_PARAMS_ENHANCED = 5  # [ka, ks, kh, kg, k_mem]
-N_PARAMS_3R2C = 6  # [ka, ks, kh, kg, k_aw, k_wa] for 3R2C two-node model
+# Number of parameters in the 3R2C two-node model.
+N_PARAMS_3R2C = 6  # [ka, ks, kh, kg, k_aw, k_wa]
 
 # Hourly bias (time-varying internal gains schedule).
 # Number of hours in a day for the per-hour bias array.

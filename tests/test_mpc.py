@@ -3,12 +3,12 @@
 import numpy as np
 
 from custom_components.predictive_heating.control import mpc
-from custom_components.predictive_heating.models.rc_model import RCModel
+from custom_components.predictive_heating.models.rc_model_3r2c import RCModel3R2C
 
 
 def _model():
-    # Stable room with meaningful heating gain. params = [ka, ks, kh, kg].
-    return RCModel(params=np.array([0.08, 0.4, 0.35, 0.0]))
+    """Stable room with meaningful heating gain."""
+    return RCModel3R2C(params=np.array([0.08, 0.4, 0.35, 0.0, 0.08, 0.02]))
 
 
 def test_box_constraints_respected():
@@ -48,7 +48,6 @@ def test_cold_room_gets_heating_and_authority():
     )
     assert res.u0 > 0.0
     assert res.has_authority
-    # Heating should pull temperature up over the horizon.
     assert res.temperature[-1] > 18.0
 
 
@@ -59,7 +58,7 @@ def test_free_heat_no_authority():
     res = mpc.solve(
         model,
         t0=24.0,
-        t_out=np.full(n, 26.0),  # warm outside -> room stays warm with no heat
+        t_out=np.full(n, 26.0),
         sol=np.ones(n),
         price=np.ones(n),
         comfort_target=21.0,
@@ -76,8 +75,8 @@ def test_price_shifts_heating_to_cheap_hours():
     model = _model()
     n = 12
     price = np.ones(n)
-    price[:6] = 5.0  # expensive early
-    price[6:] = 0.2  # cheap later
+    price[:6] = 5.0
+    price[6:] = 0.2
     res = mpc.solve(
         model,
         t0=20.5,
@@ -90,5 +89,4 @@ def test_price_shifts_heating_to_cheap_hours():
         w_comfort=1.0,
         w_energy=4.0,
     )
-    # More heat should be used in the cheap window than the expensive one.
     assert res.u[6:].sum() >= res.u[:6].sum()

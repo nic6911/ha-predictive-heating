@@ -1,12 +1,11 @@
-"""Persistence of per-zone RC models and training buffers."""
+"""Persistence of per-zone models and training buffers."""
 
 from __future__ import annotations
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import MODEL_3R2C, MODEL_AUTO, STORAGE_KEY, STORAGE_VERSION
-from .models.rc_model import RCModel
+from .const import STORAGE_KEY, STORAGE_VERSION
 from .models.rc_model_3r2c import RCModel3R2C
 
 
@@ -23,18 +22,16 @@ class ModelStore:
             self._data = loaded
         self._data.setdefault("zones", {})
 
-    def get_model(self, zone_id: str) -> RCModel | RCModel3R2C | None:
+    def get_model(self, zone_id: str) -> RCModel3R2C | None:
         raw = self._data["zones"].get(zone_id, {}).get("model")
         if not raw:
             return None
-        if raw.get("model_type") in (MODEL_3R2C, MODEL_AUTO):
-            return RCModel3R2C.from_dict(raw)
-        return RCModel.from_dict(raw)
+        return RCModel3R2C.from_dict(raw)
 
     def get_buffer(self, zone_id: str) -> list[list[float]]:
         return list(self._data["zones"].get(zone_id, {}).get("buffer", []))
 
-    def set_model(self, zone_id: str, model: RCModel) -> None:
+    def set_model(self, zone_id: str, model: RCModel3R2C) -> None:
         self._data["zones"].setdefault(zone_id, {})["model"] = model.as_dict()
 
     def set_buffer(self, zone_id: str, buffer: list[list[float]]) -> None:

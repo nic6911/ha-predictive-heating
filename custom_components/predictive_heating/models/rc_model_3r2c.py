@@ -12,23 +12,7 @@ Discrete-time difference form at 30-minute step::
                        + ks * Sol[k] + kh * u[k] + kg
     T_w[k+1] - T_w[k] = k_wa * (T_a[k] - T_w[k])
 
-The wall node stores thermal energy and releases it slowly, giving the
-model a faster air response to heating / solar while preserving the
-long-term envelope memory -- the key mechanism missing in the 1R1C model
-for zones with heavy concrete slabs.
-
 Parameters (6): [ka, ks, kh, kg, k_aw, k_wa]
-
-* ka     -- air-to-outdoor coupling (fast, 0.01..0.30),
-* ks     -- solar gain on the air node,
-* kh     -- heating gain,
-* kg     -- internal-gains offset (deg C / step),
-* k_aw   -- air-to-wall coupling (how fast T_a pulls T_w),
-* k_wa   -- wall-to-air coupling (how fast T_w pulls T_a).
-
-Conservation of energy implies ``k_aw / k_wa = C_w / C_a``.  Since the
-wall / slab has larger heat capacity than the air volume, ``k_aw > k_wa``
-(typically 2..5x).
 
 References:
     Chen et al. (2026), "3R2C and 3C-4C grey-box models for building
@@ -45,40 +29,19 @@ import numpy as np
 
 from ..const import N_HOURS, N_PARAMS_3R2C
 
-# Default parameters for a medium-weight underfloor-heated room at a 30-min step.
-# ka=0.06  -> air time constant ~ step/ka ~ 8 h (faster than 1R1C wall node)
-# ks=0.20  -> moderate solar gain
-# kh=0.20  -> heating effectiveness
-# kg=0.20  -> steady-state offset ~ kg/ka ~ 3 C above outdoor
-# k_aw=0.08 -> air pulls wall with ~6 h time constant
-# k_wa=0.02 -> wall pulls air with ~25 h time constant (heavier)
 DEFAULT_PARAMS_3R2C = np.array([0.06, 0.20, 0.20, 0.20, 0.08, 0.02], dtype=float)
-PARAM_NAMES_3R2C = ["ka", "ks", "kh", "kg", "k_aw", "k_wa"]
-
-# Bounds keep parameters physically sane.
-PARAM_LOWER_3R2C = np.array([0.005, 0.0, 0.0, -2.0, 0.001, 0.001], dtype=float)
-PARAM_UPPER_3R2C = np.array([0.50, 2.0, 1.0, 4.0, 0.50, 0.50], dtype=float)
 
 
 @dataclass
 class RCModel3R2C:
-    """Two-node 3R2C thermal model with air (fast) and wall (slow) nodes.
-
-    The model tracks an internal wall temperature :attr:`tw` that is updated
-    on every call to :meth:`step`. At the start of a forecast the wall
-    temperature is unknown; it is initialised from the air temperature
-    (equilibrium assumption) and converges to the true value within a few
-    hours of simulation.
-    """
+    """Two-node 3R2C thermal model with air (fast) and wall (slow) nodes."""
 
     params: np.ndarray = field(default_factory=lambda: DEFAULT_PARAMS_3R2C.copy())
     rmse: float | None = None
     n_samples: int = 0
     step_minutes: float = 30.0
-    model_type: str = "3r2c"
-    # Wall temperature (deg C), maintained online from accepted transitions.
+    model_type: str = "auto"
     tw: float = 0.0
-    # Time-varying output-disturbance correction per hour of day.
     hourly_bias: np.ndarray = field(default_factory=lambda: np.zeros(N_HOURS))
 
     @property
@@ -107,6 +70,14 @@ class RCModel3R2C:
     @property
     def k_wa(self) -> float: return float(self.params[5])
 
+    def predict_delta(
+        self, indoor: float, t_out: float, sol: float, u: float, tw: float | None = None
+    ) -> float:
+        """One-step temperature change prediction for disturbance detection."""
+        if tw is None:
+            tw = self.tw
+        return float(self.regressor(indoor, t_out, sol, u, tw)[:5] @ self.params[:5])
+
     def regressor(
         self, indoor: float, t_out: float, sol: float, u: float, tw: float | None = None
     ) -> np.ndarray:
@@ -119,11 +90,6 @@ class RCModel3R2C:
         self, indoor: float, t_out: float, sol: float, u: float,
         prev_delta: float = 0.0, hour: int | None = None, tw: float | None = None
     ) -> float:
-        """Advance one step and return the next indoor air temperature.
-
-        ``tw`` is the wall temperature at this step.  When ``None``, ``self.tw``
-        is used (and updated afterwards).  ``hour`` selects the time-varying bias.
-        """
         if tw is None:
             tw = self.tw
         delta = (
@@ -136,11 +102,8 @@ class RCModel3R2C:
         else:
             delta += self.bias
         next_indoor = float(indoor) + delta
-
-        # Update wall temperature.
         next_tw = tw + self.k_wa * (indoor - tw)
         self.tw = next_tw
-
         return next_indoor
 
     def simulate(
@@ -152,12 +115,6 @@ class RCModel3R2C:
         start_hour: int = 0,
         tw0: float | None = None,
     ) -> np.ndarray:
-        """Roll the model forward and return the air-temperature trajectory.
-
-        Returns an array of length ``len(u) + 1`` starting with ``t0``.
-        ``tw0`` initialises the wall temperature (defaults to ``t0``).
-        The wall temperature evolves internally.
-        """
         t_out = np.asarray(t_out, dtype=float)
         sol = np.asarray(sol, dtype=float)
         u = np.asarray(u, dtype=float)
@@ -176,7 +133,6 @@ class RCModel3R2C:
         self, t0: float, t_out: np.ndarray, sol: np.ndarray,
         start_hour: int = 0, tw0: float | None = None,
     ) -> np.ndarray:
-        """Trajectory with zero heating."""
         n = len(np.asarray(t_out))
         return self.simulate(t0, t_out, sol, np.zeros(n), start_hour=start_hour, tw0=tw0)
 
@@ -187,23 +143,13 @@ class RCModel3R2C:
         sol: np.ndarray,
         start_hour: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(T_a_free, G)`` so predicted ``T_a = T_a_free + G @ u``.
-
-        The input-output map is non-analytical for the coupled two-node
-        model, so G is built numerically via finite differences.
-
-        Uses ``self.tw`` as the initial wall temperature (tracked online
-        from the coordinator) so the slab's stored heat anchors the forecast.
-        """
         t_out = np.asarray(t_out, dtype=float)
         sol = np.asarray(sol, dtype=float)
         n = len(t_out)
-
         eps = 1e-4
         tw0 = self.tw if abs(self.tw) > 0.01 else t0
         t_free_full = self.free_float(t0, t_out, sol, start_hour=start_hour, tw0=tw0)
         t_free = t_free_full[1:]
-
         g = np.zeros((n, n), dtype=float)
         for j in range(n):
             u_pert = np.zeros(n, dtype=float)
@@ -213,7 +159,6 @@ class RCModel3R2C:
             )
             t_pert = t_pert_full[1:]
             g[:, j] = (t_pert - t_free) / eps
-
         return t_free, g
 
     def as_dict(self) -> dict:
@@ -240,18 +185,12 @@ class RCModel3R2C:
                 hourly_bias = np.full(N_HOURS, data.get("bias", 0.0))
         else:
             hourly_bias = np.full(N_HOURS, data.get("bias", 0.0))
-        loaded_type = str(data.get("model_type", "3r2c"))
-        # Treat auto as a variant of 3r2c with adaptive identification.
-        if loaded_type == "auto":
-            model_type = "auto"
-        else:
-            model_type = "3r2c"
         return cls(
             params=params,
             rmse=data.get("rmse"),
             n_samples=int(data.get("n_samples", 0)),
             step_minutes=float(data.get("step_minutes", 30.0)),
-            model_type=model_type,
+            model_type="auto",
             tw=float(data.get("tw", 0.0)),
             hourly_bias=hourly_bias,
         )

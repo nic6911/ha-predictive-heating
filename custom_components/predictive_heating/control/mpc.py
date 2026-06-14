@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..models.rc_model import RCModel
+from ..models.rc_model_3r2c import RCModel3R2C
 
 
 @dataclass
@@ -43,7 +43,7 @@ class MPCResult:
 
 
 def solve(
-    model: RCModel,
+    model: RCModel3R2C,
     t0: float,
     t_out: np.ndarray,
     sol: np.ndarray,

@@ -1,16 +1,4 @@
-"""DataUpdateCoordinator: the predictive control loop.
-
-Each cycle, for every enabled zone:
-
-1. Read indoor temperature, setpoint and actuator limits.
-2. Turn the previous observation into a training sample and update the online RLS
-   estimator (and periodically persist the model).
-3. Pull the weather + price forecast over the MPC horizon.
-4. Solve the economic MPC to get the optimal near-term heat demand ``u0``.
-5. Apply guardrails (comfort clamp, fit quality, manual-override hold, advisory mode)
-   and -- when allowed -- write the resulting setpoint to the thermostat.
-6. Publish per-zone results for the entities to display.
-"""
+"""DataUpdateCoordinator: the predictive control loop."""
 
 from __future__ import annotations
 
@@ -39,7 +27,6 @@ from .const import (
     CONF_HORIZON_HOURS,
     CONF_IRRADIANCE_SENSOR,
     CONF_MODE,
-    CONF_MODEL_TYPE,
     CONF_OUTDOOR_SENSOR,
     CONF_PRICE_ENTITY,
     CONF_PRICE_OPTIMIZE,
@@ -56,7 +43,6 @@ from .const import (
     DEFAULT_COMFORT_TARGET,
     DEFAULT_HORIZON_HOURS,
     DEFAULT_MODE,
-    DEFAULT_MODEL_TYPE,
     DEFAULT_STEP_MINUTES,
     DEFAULT_UPDATE_INTERVAL,
     DISTURBANCE_DROP_MIN,
@@ -78,21 +64,13 @@ from .forecast import (
     async_get_weather_forecast,
     solar_proxy,
 )
-from .const import MODEL_3R2C, MODEL_AUTO
-from .models.identification import (
-    BIAS_ALPHA,
-    RecursiveLeastSquares,
-    batch_fit,
-    batch_fit_3r2c,
-    batch_fit_auto,
-)
+from .models.identification import batch_fit_auto
 from .models.rc_model_3r2c import RCModel3R2C
-from .models.rc_model import RCModel
+from .models.residual_tracker import ResidualTracker
 from .storage import ModelStore
 
 _LOGGER = logging.getLogger(__name__)
 
-# Persist learned models roughly every this many cycles.
 SAVE_EVERY = 8
 
 
@@ -113,13 +91,8 @@ class ZoneResult:
     advisory: bool = False
     fit_rmse: float | None = None
     estimated_savings: float | None = None
-    # True while a window/door-type disturbance is active (learning frozen,
-    # last good setpoint held).
     disturbance: bool = False
-    # Last one-step prediction error (measured now minus previously predicted), deg C.
     prediction_error: float | None = None
-    # Predicted indoor-temperature trajectory over the MPC horizon, as a list of
-    # {"datetime", "predicted", "free_float", "outdoor"} points (step 1..n).
     forecast: list[dict] = field(default_factory=list)
     horizon_hours: float | None = None
     step_minutes: int | None = None
@@ -130,25 +103,16 @@ class _ZoneCore:
     """Internal learning/runtime state for one zone."""
 
     config: dict
-    rls: RecursiveLeastSquares
+    residual_tracker: ResidualTracker
     runtime: climate_io.ZoneRuntime
-    last_obs: dict | None = None  # {indoor, t_out, sol, u, predicted}
+    last_obs: dict | None = None
     extra: dict = field(default_factory=dict)
-    # Disturbance state: timestamp until which learning is frozen and the last good
-    # setpoint is held, plus the setpoint to hold.
     disturbance_until: object | None = None
     hold_setpoint: float | None = None
-    # Stable model used for forecasting/control: the robust batch fit, periodically
-    # re-identified from ``buffer`` (NOT the wandering online RLS).
-    model: RCModel | RCModel3R2C | None = None
-    buffer: list = field(default_factory=list)  # rows: [indoor, t_out, sol, u, next, hour]
-    # Online time-varying output-disturbance correction (deg C / step, per hour).
+    model: RCModel3R2C | None = None
+    buffer: list = field(default_factory=list)
     hourly_bias: np.ndarray = field(default_factory=lambda: np.zeros(24))
-    # Wall temperature for 3R2C model (deg C), otherwise 0.
     tw: float = 0.0
-    # Observation anchoring the next *step-spaced* buffer transition. Buffer samples
-    # are formed at ~``step_minutes`` spacing (a uniform grid) regardless of the
-    # faster control-update cadence, so the batch fit sees consistent-interval data.
     last_buffer_obs: dict | None = None
 
 
@@ -159,13 +123,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.store = store
         self._zones: dict[str, _ZoneCore] = {}
-        # Live, in-memory per-zone overrides set via entities (enable + comfort).
         self.overrides: dict[str, dict] = {}
-        # Live global optimization-mode override set via the select entity.
         self.mode_override: str | None = None
         self._cycle = 0
         interval = self._global(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
-        # Re-identify the batch model on a slow cadence (cycles per REFIT interval).
         self._refit_cycles = max(1, int(round(REFIT_INTERVAL_HOURS * 60 / interval)))
         super().__init__(
             hass,
@@ -195,15 +156,10 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         for cfg in self._zone_configs():
             zone_id = cfg[CONF_ZONE_ID]
             model = self.store.get_model(zone_id)
-            # RLS always uses 4 params (disturbance detection only).
-            rls_params = model.params[:4] if (model is not None and len(model.params) >= 4) else None
-            rls = RecursiveLeastSquares(
-                params=rls_params,
-                bias=model.bias if model else 0.0,
-            )
+            init_scale = model.rmse if (model is not None and model.rmse is not None) else 0.1
             self._zones[zone_id] = _ZoneCore(
                 config=cfg,
-                rls=rls,
+                residual_tracker=ResidualTracker(init_scale=init_scale),
                 runtime=climate_io.ZoneRuntime(zone_id=zone_id),
                 model=model,
                 buffer=[list(row) for row in self.store.get_buffer(zone_id)],
@@ -212,7 +168,6 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             )
 
     def zone_param(self, zone_id: str, key: str, default):
-        """Return a per-zone setting, preferring a live override over config."""
         override = self.overrides.get(zone_id, {})
         if key in override:
             return override[key]
@@ -265,7 +220,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         mode = self.active_mode
         w_comfort, w_energy = MODE_WEIGHTS.get(mode, MODE_WEIGHTS[DEFAULT_MODE])
         if not self._global(CONF_PRICE_OPTIMIZE, False):
-            w_energy = min(w_energy, 0.05)  # efficiency only, ignore price shape
+            w_energy = min(w_energy, 0.05)
         return w_comfort, w_energy
 
     # ----------------------------------------------------------------- cycle
@@ -333,60 +288,41 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             current_setpoint=current_setpoint,
         )
 
-        # 1) Learn from the previous observation, with disturbance rejection.
-        #
-        # We work in temperature-difference form: the model predicts the change
-        # ``indoor - prev_indoor`` from the regressor ``[t_out-indoor, sol, u, 1]``.
-        # A window/door disturbance shows up as the room cooling far faster than the
-        # model expects (a large *negative* residual). When that happens we freeze
-        # learning and hold the last good setpoint for a recovery window, so a
-        # transient never corrupts the learned dynamics.
+        # 1) Disturbance detection from one-step residual.
         in_hold = core.disturbance_until is not None and now < core.disturbance_until
         disturbance = in_hold
         if core.last_obs is not None and indoor is not None:
             prev = core.last_obs
-            phi_d = np.array(
-                [
-                    prev["t_out"] - prev["indoor"],
-                    prev["sol"],
-                    prev["u"],
-                    1.0,
-                ]
-            )
-            predicted_delta = core.rls.predict_delta(phi_d)
+            # Predicted temperature change from the batch model (or default if cold start).
+            if core.model is not None:
+                predicted_delta = core.model.predict_delta(
+                    prev["indoor"], prev["t_out"], prev["sol"], prev["u"], core.tw,
+                )
+            else:
+                predicted_delta = 0.0
             measured_delta = indoor - prev["indoor"]
             residual = measured_delta - predicted_delta
             result.prediction_error = round(residual, 3)
 
-            scale = core.rls._scale or 0.0
+            scale = core.residual_tracker.scale
             drop_threshold = max(
                 DISTURBANCE_DROP_MIN, DISTURBANCE_DROP_SIGMA * scale
             )
             if residual < -drop_threshold:
-                # New (or continuing) disturbance: freeze learning, hold setpoint.
                 disturbance = True
                 core.disturbance_until = now + DISTURBANCE_HOLD
             elif in_hold and residual > -DISTURBANCE_DROP_MIN:
-                # Temperature has recovered toward the prediction -> release hold.
                 disturbance = False
                 core.disturbance_until = None
 
             if not disturbance:
-                # Innovation-gated RLS update (kept for one-step residual scale and
-                # disturbance detection only -- NOT used for the forecast).
-                core.rls.update(phi_d, measured_delta)
+                core.residual_tracker.update(residual)
 
         result.disturbance = disturbance
 
         step_min = self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES)
 
         # ---- Step-spaced buffering for the stable batch fit ------------------
-        # The control loop runs faster than the model step. Build buffer samples on
-        # a uniform ~``step_minutes`` grid so the batch fit (and the offset-free
-        # bias) see consistent-interval transitions -- exactly the grid the offline
-        # validation used. A disturbance freezes buffering and re-anchors the grid
-        # so no transition ever spans an open-window event.
-        # Each buffer row: [indoor, t_out, sol, u, next, hour_of_day].
         if indoor is not None and current_setpoint is not None:
             lb = core.last_buffer_obs
             elapsed_ok = (
@@ -394,25 +330,17 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 and (now - lb["time"]).total_seconds() >= 0.9 * step_min * 60
             )
             if disturbance:
-                core.last_buffer_obs = None  # break the grid across the disturbance
+                core.last_buffer_obs = None
             elif elapsed_ok:
-                hour = lb["time"].hour  # UTC hour of the sample start
+                hour = lb["time"].hour
                 core.buffer.append(
                     [lb["indoor"], lb["t_out"], lb["sol"], lb["u"], indoor, hour]
                 )
-                # Online time-varying bias ``hourly_bias[h]``: per-hour EWMA of
-                # accepted step residuals of the stable batch model, so the
-                # multi-step open-loop forecast captures diurnal occupancy pattern
-                # (Lin et al., 2024, two-step identification).
+                # Online per-hour bias update.
                 if core.model is not None:
-                    if hasattr(core.model, 'tw'):
-                        phi_lb = core.model.regressor(
-                            lb["indoor"], lb["t_out"], lb["sol"], lb["u"], tw=core.tw,
-                        )
-                    else:
-                        phi_lb = core.model.regressor(
-                            lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
-                        )
+                    phi_lb = core.model.regressor(
+                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"], tw=core.tw,
+                    )
                     r = (indoor - lb["indoor"]) - float(phi_lb @ core.model.params)
                     if abs(r) <= OUTLIER_ABS_CAP and 0 <= hour < 24:
                         core.hourly_bias[hour] = (
@@ -420,80 +348,62 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                             + HBIAS_ALPHA * r
                         )
                         core.hourly_bias = np.clip(core.hourly_bias, -0.5, 0.5)
-                    # Update wall temperature for 3R2C model.
-                    if hasattr(core.model, 'tw'):
-                        core.model.tw = core.tw
-                        core.model.step(
-                            lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
-                            hour=hour,
-                        )
-                        core.tw = core.model.tw
-                core.last_buffer_obs = None  # consumed -> re-anchor below
+                    # Update wall temperature.
+                    core.model.tw = core.tw
+                    core.model.step(
+                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
+                        hour=hour,
+                    )
+                    core.tw = core.model.tw
+                core.last_buffer_obs = None
             if core.last_buffer_obs is None:
                 core.last_buffer_obs = {
                     "indoor": indoor,
                     "t_out": t_out_now,
                     "sol": sol_now,
-                    "u": RCModel.heat_demand(current_setpoint, indoor),
+                    "u": RCModel3R2C.heat_demand(current_setpoint, indoor),
                     "time": now,
                 }
 
-        # Cap the rolling buffer to the most recent BUFFER_DAYS of samples.
+        # Cap the rolling buffer.
         max_samples = max(MIN_REFIT_SAMPLES, int(BUFFER_DAYS * 24 * 60 / step_min))
         if len(core.buffer) > max_samples:
             del core.buffer[: len(core.buffer) - max_samples]
 
-        # Periodically re-identify the stable batch model from the buffer. This is
-        # what the MPC/forecast use -- robust, regularised and excitation-guarded, so
-        # the open-loop horizon does not drift the way the online RLS does.
+        # Periodically re-identify the batch model.
         if (
             self._cycle % self._refit_cycles == 0
             and len(core.buffer) >= MIN_REFIT_SAMPLES
         ):
             first_fit = core.model is None
-            model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
-            if model_type == MODEL_AUTO:
-                core.model = batch_fit_auto(
-                    core.buffer, step_minutes=step_min,
-                )
-            elif model_type == MODEL_3R2C:
-                core.model = batch_fit_3r2c(
-                    core.buffer, step_minutes=step_min,
-                )
-            else:
-                core.model = batch_fit(
-                    core.buffer, step_minutes=step_min, model_type=model_type
-                )
+            core.model = batch_fit_auto(
+                core.buffer, step_minutes=step_min,
+            )
             if first_fit:
-                # Seed the online hourly bias from the batch fit.
                 core.hourly_bias = core.model.hourly_bias.copy()
-                if hasattr(core.model, 'tw'):
-                    core.tw = core.model.tw
+                core.tw = core.model.tw
 
-        # Record this observation for next cycle's learning / detection.
+        # Record this observation for next cycle.
         if indoor is not None and current_setpoint is not None:
             core.last_obs = {
                 "indoor": indoor,
                 "t_out": t_out_now,
                 "sol": sol_now,
-                "u": RCModel.heat_demand(current_setpoint, indoor),
+                "u": RCModel3R2C.heat_demand(current_setpoint, indoor),
             }
 
-        # Forecast/control from the stable batch model + online hourly bias.
-        # Fall back to the RLS estimate only at cold start before the first
-        # batch refit exists.
+        # Forecast/control from the batch model + online hourly bias.
         if core.model is not None:
             kwargs = dict(hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5))
-            if hasattr(core.model, 'tw'):
-                kwargs['tw'] = core.tw
+            kwargs['tw'] = core.tw
             model = replace(core.model, **kwargs)
         else:
-            model = core.rls.to_model(step_minutes=step_min)
+            model = RCModel3R2C(
+                rmse=None, n_samples=0,
+                step_minutes=step_min, model_type="auto",
+            )
         result.fit_rmse = model.rmse
 
-        # We still compute predictions/recommendations when the zone is disabled
-        # so the sensors stay meaningful; we simply never write the setpoint then
-        # (handled by the advisory guardrail below).
         if indoor is None or len(t_out_fc) == 0:
             return result
 
@@ -524,23 +434,17 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             start_hour=start_hour,
         )
 
-        # Honest summer / no-authority behaviour: if the room free-floats above the
-        # comfort ceiling for the whole horizon, the heating has no downward control
-        # authority -- never recommend heating an already-too-warm room.
         free_float = np.asarray(plan.free_float, dtype=float)
         summer_no_authority = len(free_float) > 0 and bool(
             np.all(free_float >= comfort_max)
         )
         has_authority = plan.has_authority and not summer_no_authority
 
-        # Map the near-term heat demand back to a thermostat setpoint.
         recommended = indoor + plan.u0
         recommended = max(comfort_min, min(comfort_max, recommended))
         if not has_authority:
             recommended = comfort_min
 
-        # During an active disturbance (e.g. an open window) freeze control and hold
-        # the last good setpoint rather than chasing the transient.
         if disturbance and core.hold_setpoint is not None:
             recommended = core.hold_setpoint
 
@@ -550,7 +454,6 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         )
         result.has_authority = has_authority
 
-        # Publish the full predicted trajectory so it can be graphed over the horizon.
         step_min = int(self._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES))
         forecast: list[dict] = []
         for k in range(len(plan.temperature)):
@@ -567,7 +470,6 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         result.horizon_hours = self._global(CONF_HORIZON_HOURS, DEFAULT_HORIZON_HOURS)
         result.step_minutes = step_min
 
-        # Estimated savings proxy: heat avoided versus holding the comfort target.
         baseline_u = max(0.0, comfort_target - indoor)
         result.estimated_savings = round(max(0.0, baseline_u - plan.u0), 2)
 
@@ -591,8 +493,6 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             result.applied = await climate_io.async_write_setpoint(
                 self.hass, climate_entity, core.runtime, result.recommended_setpoint
             )
-            # Remember the last good (undisturbed) setpoint so we can hold it if a
-            # disturbance starts on a later cycle.
             if not disturbance:
                 core.hold_setpoint = result.recommended_setpoint
         return result
@@ -605,24 +505,19 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         for zone_id, core in self._zones.items():
             if core.model is not None:
                 kwargs = dict(hourly_bias=np.clip(core.hourly_bias, -0.5, 0.5))
-                if hasattr(core.model, 'tw'):
-                    kwargs['tw'] = core.tw
+                kwargs['tw'] = core.tw
                 model = replace(core.model, **kwargs)
-            else:
-                model = core.rls.to_model()
-            self.store.set_model(zone_id, model)
+                self.store.set_model(zone_id, model)
             self.store.set_buffer(zone_id, [list(row) for row in core.buffer])
         await self.store.async_save()
 
     async def async_train_zone_from_history(self, zone_id: str) -> None:
-        """Hook for batch bootstrap from recorder history (see services)."""
-        # Implemented in services.py via recorder; kept here for API symmetry.
         return None
 
     def reset_zone(self, zone_id: str) -> None:
         core = self._zones.get(zone_id)
         if core is not None:
-            core.rls = RecursiveLeastSquares()
+            core.residual_tracker = ResidualTracker(init_scale=0.1)
             core.last_obs = None
             core.last_buffer_obs = None
             core.disturbance_until = None

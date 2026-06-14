@@ -24,7 +24,6 @@ from .const import (
     CONF_HORIZON_HOURS,
     CONF_IRRADIANCE_SENSOR,
     CONF_MODE,
-    CONF_MODEL_TYPE,
     CONF_OUTDOOR_SENSOR,
     CONF_PRICE_ENTITY,
     CONF_PRICE_OPTIMIZE,
@@ -42,14 +41,12 @@ from .const import (
     DEFAULT_CO2_OPTIMIZE,
     DEFAULT_HORIZON_HOURS,
     DEFAULT_MODE,
-    DEFAULT_MODEL_TYPE,
     DEFAULT_PRICE_OPTIMIZE,
     DEFAULT_STEP_MINUTES,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     MAX_ZONES,
     MODES,
-    MODEL_TYPES,
     ZONE_MODE_AUTO,
     ZONE_MODES,
 )
@@ -177,12 +174,6 @@ def _zone_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(
                 CONF_ZONE_ENABLED, default=defaults.get(CONF_ZONE_ENABLED, True)
             ): selector.BooleanSelector(),
-            vol.Optional(
-                CONF_MODEL_TYPE,
-                default=defaults.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE),
-            ): selector.SelectSelector(
-                selector.SelectSelectorConfig(options=MODEL_TYPES, translation_key="model_type")
-            ),
         }
     )
 

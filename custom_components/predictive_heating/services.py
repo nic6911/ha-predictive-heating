@@ -16,28 +16,20 @@ from .const import (
     CONF_COMFORT_MAX,
     CONF_COMFORT_MIN,
     CONF_COMFORT_TARGET,
-    CONF_MODEL_TYPE,
     CONF_OUTDOOR_SENSOR,
     CONF_STEP_MINUTES,
     CONF_TEMP_SENSOR,
     CONF_WEATHER_ENTITY,
     CONF_ZONE_ID,
-    DEFAULT_MODEL_TYPE,
     DEFAULT_STEP_MINUTES,
     DOMAIN,
-    MODEL_3R2C,
-    MODEL_AUTO,
     PLAUSIBLE_TEMP_MAX,
     PLAUSIBLE_TEMP_MIN,
 )
 from .forecast import clear_sky_index
-from .models.identification import (
-    RecursiveLeastSquares,
-    batch_fit,
-    batch_fit_3r2c,
-    batch_fit_auto,
-)
-from .models.rc_model import RCModel
+from .models.identification import batch_fit_auto
+from .models.rc_model_3r2c import RCModel3R2C
+from .models.residual_tracker import ResidualTracker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,7 +62,6 @@ def _iter_coordinators(hass: HomeAssistant):
 
 
 def _plausible(value: float) -> bool:
-    """Reject sensor-fault readings (e.g. the 327.67 C sentinel) from training."""
     return PLAUSIBLE_TEMP_MIN <= value <= PLAUSIBLE_TEMP_MAX
 
 
@@ -95,12 +86,6 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     temp_sensor = cfg.get(CONF_TEMP_SENSOR)
     outdoor_sensor = cfg.get(CONF_OUTDOOR_SENSOR)
     step_min = coordinator._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES)
-    # When no dedicated outdoor sensor is configured, reconstruct the outdoor
-    # temperature history from the configured weather entity's recorded
-    # ``temperature`` attribute -- the SAME signal the live forecast uses. A
-    # constant fallback would make the (T_out - T_indoor) regressor nearly
-    # constant, leaving ka/kg unidentifiable so the open-loop horizon drifts to
-    # an implausible steady state (Bacher & Madsen 2011; see ITERATION 3.2).
     weather_entity = (
         None if outdoor_sensor else coordinator._global(CONF_WEATHER_ENTITY)
     )
@@ -174,9 +159,6 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     indoor = _resample(indoor_pairs, grid)
     setpoint = _resample(setpoint_pairs, grid)
     outdoor = _resample(outdoor_pairs, grid) if outdoor_pairs else [None] * n
-    # Back-fill leading grid points (before the first recorded outdoor reading)
-    # with the first real value rather than fabricating a constant, so the
-    # outdoor regressor stays representative and ka/kg remain identifiable.
     first_outdoor = next((v for v in outdoor if v is not None), None)
     if first_outdoor is not None:
         for k in range(n):
@@ -197,31 +179,20 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         ):
             continue
         t_out = outdoor[k] if outdoor[k] is not None else 8.0
-        u = RCModel.heat_demand(setpoint[k], indoor[k])
+        u = RCModel3R2C.heat_demand(setpoint[k], indoor[k])
         sol = clear_sky_index(grid[k], lat, lon)
-        hour = grid[k].hour  # UTC hour for hourly bias initialisation
+        hour = grid[k].hour
         samples.append((indoor[k], t_out, sol, u, indoor[k + 1], hour))
 
-    model_type = cfg.get(CONF_MODEL_TYPE, DEFAULT_MODEL_TYPE)
-    if model_type == MODEL_AUTO:
-        model = batch_fit_auto(samples, step_minutes=step_min)
-    elif model_type == MODEL_3R2C:
-        model = batch_fit_3r2c(samples, step_minutes=step_min)
-    else:
-        model = batch_fit(samples, step_minutes=step_min, model_type=model_type)
+    model = batch_fit_auto(samples, step_minutes=step_min)
     zone_id = cfg[CONF_ZONE_ID]
     core = coordinator._zones.get(zone_id)
     if core is not None:
-        core.rls = RecursiveLeastSquares(
-            params=model.params[:4] if len(model.params) >= 4 else None,
-            bias=model.bias,
-        )
+        core.residual_tracker = ResidualTracker(init_scale=model.rmse if model.rmse else 0.1)
         core.last_obs = None
         core.last_buffer_obs = None
         core.disturbance_until = None
         core.hold_setpoint = None
-        # Seed the stable forecast model, rolling buffer and hourly bias so the
-        # zone immediately forecasts/controls from the robust batch fit.
         core.model = model
         core.buffer = [list(s) for s in samples]
         core.hourly_bias = model.hourly_bias.copy()
