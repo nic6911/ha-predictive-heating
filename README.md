@@ -59,7 +59,12 @@ The `predicted_temperature` sensor also exposes a `forecast` attribute with the 
 predicted indoor-temperature trajectory over the horizon (for graphing with ApexCharts).
 
 Global: `switch` master *Predictive control*, `select` *Optimization profile*
-(comfort / balanced / eco / price).
+(comfort / balanced / eco / price), and `number` *All zones: comfort
+minimum/target/maximum*. Changing a controller-wide comfort number pushes it to
+every zone at once (like sync on a car aircon); you can still fine-tune an
+individual zone afterwards with its own number entity. All comfort bounds,
+per-zone enable, the optimization profile and the master switch are persisted
+across Home Assistant restarts.
 
 ## Services
 

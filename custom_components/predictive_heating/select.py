@@ -46,6 +46,6 @@ class ModeSelect(SelectEntity):
         return self.coordinator.active_mode
 
     async def async_select_option(self, option: str) -> None:
-        self.coordinator.mode_override = option
+        self.coordinator.set_mode_override(option)
         self.async_write_ha_state()
         await self.coordinator.async_request_refresh()

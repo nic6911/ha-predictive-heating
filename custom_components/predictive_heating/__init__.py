@@ -18,10 +18,15 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Predictive Floor Heating from a config entry."""
     domain_data = hass.data.setdefault(DOMAIN, {})
-    domain_data.setdefault("master_enabled", True)
 
     store = ModelStore(hass, entry.entry_id)
     await store.async_load()
+
+    stored_master = store.get_master_enabled()
+    if stored_master is not None:
+        domain_data["master_enabled"] = stored_master
+    else:
+        domain_data.setdefault("master_enabled", True)
 
     coordinator = PredictiveHeatingCoordinator(hass, entry, store)
     coordinator.init_zones()

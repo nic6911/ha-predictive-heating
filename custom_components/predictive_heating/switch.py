@@ -53,12 +53,12 @@ class MasterSwitch(SwitchEntity):
         )
 
     async def async_turn_on(self, **kwargs) -> None:
-        self.coordinator.hass.data[DOMAIN]["master_enabled"] = True
+        self.coordinator.set_master_enabled(True)
         self.async_write_ha_state()
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
-        self.coordinator.hass.data[DOMAIN]["master_enabled"] = False
+        self.coordinator.set_master_enabled(False)
         self.async_write_ha_state()
 
 

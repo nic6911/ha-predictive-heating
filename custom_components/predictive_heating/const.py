@@ -65,6 +65,11 @@ MODEL_AUTO = "auto"
 PLAUSIBLE_TEMP_MIN = -10.0
 PLAUSIBLE_TEMP_MAX = 50.0
 
+# Maximum change (deg C) between two consecutive accepted indoor readings. A
+# larger one-step jump is treated as a sensor glitch (e.g. a sample reading 0)
+# and ignored, so a single bad value can never enter learning or control.
+MAX_SAMPLE_JUMP = 5.0
+
 # Control behaviour
 SETPOINT_DEADBAND = 0.2  # deg C; only write if change exceeds this
 MANUAL_OVERRIDE_TOLERANCE = 0.05  # deg C tolerance for detecting external setpoint change

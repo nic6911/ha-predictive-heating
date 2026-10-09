@@ -1,4 +1,4 @@
-"""Persistence of per-zone models and training buffers."""
+"""Persistence of per-zone models, training buffers and runtime overrides."""
 
 from __future__ import annotations
 
@@ -14,14 +14,16 @@ class ModelStore:
 
     def __init__(self, hass: HomeAssistant, entry_id: str) -> None:
         self._store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}_{entry_id}")
-        self._data: dict = {"zones": {}}
+        self._data: dict = {"zones": {}, "meta": {}}
 
     async def async_load(self) -> None:
         loaded = await self._store.async_load()
         if loaded:
             self._data = loaded
         self._data.setdefault("zones", {})
+        self._data.setdefault("meta", {})
 
+    # ---------------------------------------------------------------- models
     def get_model(self, zone_id: str) -> RCModel3R2C | None:
         raw = self._data["zones"].get(zone_id, {}).get("model")
         if not raw:
@@ -39,6 +41,34 @@ class ModelStore:
 
     def clear_zone(self, zone_id: str) -> None:
         self._data["zones"].pop(zone_id, None)
+
+    # ------------------------------------------------------------------ meta
+    def _meta(self) -> dict:
+        return self._data.setdefault("meta", {})
+
+    def get_overrides(self) -> dict:
+        return dict(self._meta().get("overrides", {}))
+
+    def set_overrides(self, overrides: dict) -> None:
+        self._meta()["overrides"] = overrides
+
+    def get_global_comfort(self) -> dict:
+        return dict(self._meta().get("global_comfort", {}))
+
+    def set_global_comfort(self, comfort: dict) -> None:
+        self._meta()["global_comfort"] = comfort
+
+    def get_mode_override(self) -> str | None:
+        return self._meta().get("mode_override")
+
+    def set_mode_override(self, mode: str | None) -> None:
+        self._meta()["mode_override"] = mode
+
+    def get_master_enabled(self) -> bool | None:
+        return self._meta().get("master_enabled")
+
+    def set_master_enabled(self, enabled: bool) -> None:
+        self._meta()["master_enabled"] = bool(enabled)
 
     async def async_save(self) -> None:
         await self._store.async_save(self._data)

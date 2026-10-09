@@ -51,6 +51,7 @@ from .const import (
     DOMAIN,
     FIT_RMSE_AUTONOMY_THRESHOLD,
     HBIAS_ALPHA,
+    MAX_SAMPLE_JUMP,
     MIN_REFIT_SAMPLES,
     MODE_WEIGHTS,
     OUTLIER_ABS_CAP,
@@ -123,8 +124,15 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.store = store
         self._zones: dict[str, _ZoneCore] = {}
-        self.overrides: dict[str, dict] = {}
-        self.mode_override: str | None = None
+        self.overrides: dict[str, dict] = dict(store.get_overrides())
+        self.mode_override: str | None = store.get_mode_override()
+        self.global_comfort: dict = {
+            CONF_COMFORT_MIN: DEFAULT_COMFORT_MIN,
+            CONF_COMFORT_TARGET: DEFAULT_COMFORT_TARGET,
+            CONF_COMFORT_MAX: DEFAULT_COMFORT_MAX,
+            **store.get_global_comfort(),
+        }
+        self._save_pending = False
         self._cycle = 0
         interval = self._global(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         self._refit_cycles = max(1, int(round(REFIT_INTERVAL_HOURS * 60 / interval)))
@@ -172,12 +180,56 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         if key in override:
             return override[key]
         for cfg in self._zone_configs():
-            if cfg.get(CONF_ZONE_ID) == zone_id:
-                return cfg.get(key, default)
+            if cfg.get(CONF_ZONE_ID) == zone_id and key in cfg:
+                return cfg[key]
+        if key in self.global_comfort:
+            return self.global_comfort[key]
         return default
 
     def set_zone_override(self, zone_id: str, key: str, value) -> None:
         self.overrides.setdefault(zone_id, {})[key] = value
+        self._mark_dirty()
+
+    def global_comfort_value(self, key: str):
+        return self.global_comfort.get(key)
+
+    def set_global_comfort(self, key: str, value: float) -> None:
+        """Set a comfort bound globally and push it to every configured zone.
+
+        Individual zones can still be adjusted afterwards; their override simply
+        wins until the next ``set_global_comfort`` call.
+        """
+        value = float(value)
+        self.global_comfort[key] = value
+        self.store.set_global_comfort(self.global_comfort)
+        for cfg in self._zone_configs():
+            self.overrides.setdefault(cfg[CONF_ZONE_ID], {})[key] = value
+        self._mark_dirty()
+
+    def set_mode_override(self, mode: str | None) -> None:
+        self.mode_override = mode
+        self.store.set_mode_override(mode)
+        self._mark_dirty()
+
+    def set_master_enabled(self, enabled: bool) -> None:
+        self.hass.data.setdefault(DOMAIN, {})["master_enabled"] = bool(enabled)
+        self.store.set_master_enabled(bool(enabled))
+        self._mark_dirty()
+
+    def _mark_dirty(self) -> None:
+        """Persist overrides to the store and schedule a background save."""
+        self.store.set_overrides(self.overrides)
+        if self._save_pending:
+            return
+        self._save_pending = True
+
+        async def _save() -> None:
+            try:
+                await self.store.async_save()
+            finally:
+                self._save_pending = False
+
+        self.hass.async_create_task(_save())
 
     # ---------------------------------------------------------------- inputs
     def _current_outdoor_solar(self, cfg: dict) -> tuple[float, float]:
@@ -276,6 +328,21 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         indoor = climate_io.read_indoor(
             self.hass, climate_entity, cfg.get(CONF_TEMP_SENSOR)
         )
+        # Reject single-sample spikes (e.g. a sensor glitching to 0 C) that would
+        # otherwise poison the residual tracker and the learning buffer. The last
+        # accepted observation is kept, so the control loop simply coasts one step.
+        if (
+            indoor is not None
+            and core.last_obs is not None
+            and abs(indoor - core.last_obs["indoor"]) > MAX_SAMPLE_JUMP
+        ):
+            _LOGGER.debug(
+                "Zone %s: ignoring implausible %.2f C jump (prev %.2f)",
+                zone_id,
+                indoor - core.last_obs["indoor"],
+                core.last_obs["indoor"],
+            )
+            indoor = None
         current_setpoint = climate_io.read_setpoint(self.hass, climate_entity)
         t_out_now, sol_now = self._current_outdoor_solar(cfg)
         now = dt_util.utcnow()

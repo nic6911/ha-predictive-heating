@@ -113,7 +113,10 @@
     "number": {
       "comfort_min": { "name": "Comfort minimum" },
       "comfort_target": { "name": "Comfort target" },
-      "comfort_max": { "name": "Comfort maximum" }
+      "comfort_max": { "name": "Comfort maximum" },
+      "global_comfort_min": { "name": "All zones: comfort minimum" },
+      "global_comfort_target": { "name": "All zones: comfort target" },
+      "global_comfort_max": { "name": "All zones: comfort maximum" }
     },
     "select": {
       "mode": { "name": "Optimization profile" }
