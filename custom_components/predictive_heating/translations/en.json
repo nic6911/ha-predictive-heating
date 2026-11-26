@@ -39,11 +39,17 @@
           "price_entity": "Energy price sensor (optional)",
           "co2_entity": "CO2 intensity sensor (optional)",
           "co2_optimize": "Enable CO2-aware scheduling",
+          "outdoor_sensor": "Outdoor temperature sensor (optional, all zones)",
+          "ventilation_sensor": "Ventilation supply temperature sensor (optional)",
           "price_optimize": "Enable price-aware scheduling",
           "mode": "Optimization profile",
           "horizon_hours": "Prediction horizon (hours)",
           "step_minutes": "Control step (minutes)",
           "update_interval_minutes": "Update interval (minutes)"
+        },
+        "data_description": {
+          "outdoor_sensor": "Optional. A measured outdoor temperature (°C). It is used for learning and anchors the weather forecast at the current reading. A per-zone outdoor sensor still overrides it.",
+          "ventilation_sensor": "Optional. The ventilation system's supply/inlet air temperature (e.g. after the heater). The airflow is unknown, so this is only a qualitative disturbance input for the learned model; it is never used to compute energy. Leave empty if you do not have one."
         }
       },
       "add_zone": {
@@ -104,7 +110,8 @@
     "binary_sensor": {
       "manual_override": { "name": "Manual override active" },
       "free_heat": { "name": "Coasting on free heat" },
-      "disturbance_detected": { "name": "Disturbance detected (window/door)" }
+      "disturbance_detected": { "name": "Disturbance detected (window/door)" },
+      "setpoint_in_sync": { "name": "Setpoint applied" }
     },
     "switch": {
       "master_enable": { "name": "Autonomous control (master)" },

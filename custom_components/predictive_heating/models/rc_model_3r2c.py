@@ -10,9 +10,15 @@ Discrete-time difference form at 30-minute step::
     T_a[k+1] - T_a[k] = ka * (T_out[k] - T_a[k])
                        + k_aw * (T_w[k] - T_a[k])
                        + ks * Sol[k] + kh * u[k] + kg
-    T_w[k+1] - T_w[k] = k_wa * (T_a[k] - T_w[k])
+                       + k_vent * (T_vent[k] - T_a[k])
+    T_w[k+1] = T_w[k] + k_wa * (T_a[k] - T_w[k])
 
-Parameters (6): [ka, ks, kh, kg, k_aw, k_wa]
+Parameters (7): [ka, ks, kh, kg, k_aw, k_wa, k_vent]
+
+``k_vent`` is optional. It is only identified when a ventilation supply/inlet
+temperature sensor is configured; otherwise it stays 0 and the term vanishes.
+The airflow is unknown, so this is a qualitative disturbance input -- it is
+never used to compute energy.
 
 References:
     Chen et al. (2026), "3R2C and 3C-4C grey-box models for building
@@ -29,7 +35,8 @@ import numpy as np
 
 from ..const import N_HOURS, N_PARAMS_3R2C
 
-DEFAULT_PARAMS_3R2C = np.array([0.06, 0.20, 0.20, 0.20, 0.08, 0.02], dtype=float)
+# [ka, ks, kh, kg, k_aw, k_wa, k_vent]
+DEFAULT_PARAMS_3R2C = np.array([0.06, 0.20, 0.20, 0.20, 0.08, 0.02, 0.0], dtype=float)
 
 
 @dataclass
@@ -43,6 +50,15 @@ class RCModel3R2C:
     model_type: str = "auto"
     tw: float = 0.0
     hourly_bias: np.ndarray = field(default_factory=lambda: np.zeros(N_HOURS))
+
+    def __post_init__(self) -> None:
+        params = np.asarray(self.params, dtype=float).ravel()
+        if params.shape == (N_PARAMS_3R2C - 1,):
+            # Models stored before the optional ventilation term existed.
+            params = np.concatenate([params, [0.0]])
+        if params.shape != (N_PARAMS_3R2C,):
+            params = DEFAULT_PARAMS_3R2C.copy()
+        self.params = params
 
     @property
     def bias(self) -> float:
@@ -69,26 +85,55 @@ class RCModel3R2C:
     def k_aw(self) -> float: return float(self.params[4])
     @property
     def k_wa(self) -> float: return float(self.params[5])
+    @property
+    def k_vent(self) -> float: return float(self.params[6])
 
     def predict_delta(
-        self, indoor: float, t_out: float, sol: float, u: float, tw: float | None = None
+        self,
+        indoor: float,
+        t_out: float,
+        sol: float,
+        u: float,
+        tw: float | None = None,
+        vent: float | None = None,
     ) -> float:
         """One-step temperature change prediction for disturbance detection."""
         if tw is None:
             tw = self.tw
-        return float(self.regressor(indoor, t_out, sol, u, tw)[:5] @ self.params[:5])
+        return float(self.regressor(indoor, t_out, sol, u, tw, vent) @ self.params)
 
     def regressor(
-        self, indoor: float, t_out: float, sol: float, u: float, tw: float | None = None
+        self,
+        indoor: float,
+        t_out: float,
+        sol: float,
+        u: float,
+        tw: float | None = None,
+        vent: float | None = None,
     ) -> np.ndarray:
-        """Difference-form regressor for the air-temperature change."""
+        """Difference-form regressor for the air-temperature change.
+
+        The sixth entry is a zero placeholder for ``k_wa`` (handled by
+        :meth:`step`); the seventh is the optional ventilation effect.
+        """
         if tw is None:
             tw = self.tw
-        return np.array([t_out - indoor, sol, u, 1.0, tw - indoor, 0.0], dtype=float)
+        vent_effect = 0.0 if vent is None else float(vent) - float(indoor)
+        return np.array(
+            [t_out - indoor, sol, u, 1.0, tw - indoor, 0.0, vent_effect],
+            dtype=float,
+        )
 
     def step(
-        self, indoor: float, t_out: float, sol: float, u: float,
-        prev_delta: float = 0.0, hour: int | None = None, tw: float | None = None
+        self,
+        indoor: float,
+        t_out: float,
+        sol: float,
+        u: float,
+        prev_delta: float = 0.0,
+        hour: int | None = None,
+        tw: float | None = None,
+        vent: float | None = None,
     ) -> float:
         if tw is None:
             tw = self.tw
@@ -97,6 +142,8 @@ class RCModel3R2C:
             + self.k_aw * (tw - indoor)
             + self.ks * sol + self.kh * u + self.kg
         )
+        if vent is not None and self.k_vent:
+            delta += self.k_vent * (float(vent) - float(indoor))
         if hour is not None and 0 <= hour < N_HOURS:
             delta += self.hourly_bias[hour]
         else:
@@ -114,10 +161,12 @@ class RCModel3R2C:
         u: np.ndarray,
         start_hour: int = 0,
         tw0: float | None = None,
+        vent: np.ndarray | None = None,
     ) -> np.ndarray:
         t_out = np.asarray(t_out, dtype=float)
         sol = np.asarray(sol, dtype=float)
         u = np.asarray(u, dtype=float)
+        vent_arr = None if vent is None else np.asarray(vent, dtype=float)
         n = len(u)
         out = np.empty(n + 1, dtype=float)
         out[0] = t0
@@ -125,16 +174,24 @@ class RCModel3R2C:
         self.tw = tw
         for k in range(n):
             hour = self._hour_at(start_hour, k, self.step_minutes)
-            out[k + 1] = self.step(out[k], t_out[k], sol[k], u[k], hour=hour)
+            v = None if vent_arr is None else float(vent_arr[k])
+            out[k + 1] = self.step(out[k], t_out[k], sol[k], u[k], hour=hour, vent=v)
             tw = self.tw
         return out
 
     def free_float(
-        self, t0: float, t_out: np.ndarray, sol: np.ndarray,
-        start_hour: int = 0, tw0: float | None = None,
+        self,
+        t0: float,
+        t_out: np.ndarray,
+        sol: np.ndarray,
+        start_hour: int = 0,
+        tw0: float | None = None,
+        vent: np.ndarray | None = None,
     ) -> np.ndarray:
         n = len(np.asarray(t_out))
-        return self.simulate(t0, t_out, sol, np.zeros(n), start_hour=start_hour, tw0=tw0)
+        return self.simulate(
+            t0, t_out, sol, np.zeros(n), start_hour=start_hour, tw0=tw0, vent=vent
+        )
 
     def prediction_matrices(
         self,
@@ -142,20 +199,23 @@ class RCModel3R2C:
         t_out: np.ndarray,
         sol: np.ndarray,
         start_hour: int = 0,
+        vent: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         t_out = np.asarray(t_out, dtype=float)
         sol = np.asarray(sol, dtype=float)
         n = len(t_out)
         eps = 1e-4
         tw0 = self.tw if abs(self.tw) > 0.01 else t0
-        t_free_full = self.free_float(t0, t_out, sol, start_hour=start_hour, tw0=tw0)
+        t_free_full = self.free_float(
+            t0, t_out, sol, start_hour=start_hour, tw0=tw0, vent=vent
+        )
         t_free = t_free_full[1:]
         g = np.zeros((n, n), dtype=float)
         for j in range(n):
             u_pert = np.zeros(n, dtype=float)
             u_pert[j] = eps
             t_pert_full = self.simulate(
-                t0, t_out, sol, u_pert, start_hour=start_hour, tw0=tw0,
+                t0, t_out, sol, u_pert, start_hour=start_hour, tw0=tw0, vent=vent
             )
             t_pert = t_pert_full[1:]
             g[:, j] = (t_pert - t_free) / eps
@@ -176,6 +236,9 @@ class RCModel3R2C:
     @classmethod
     def from_dict(cls, data: dict) -> "RCModel3R2C":
         params = np.array(data.get("params", DEFAULT_PARAMS_3R2C.tolist()), dtype=float)
+        if params.shape == (N_PARAMS_3R2C - 1,):
+            # Stored before the optional ventilation term: pad with k_vent = 0.
+            params = np.concatenate([params, [0.0]])
         if params.shape != (N_PARAMS_3R2C,):
             params = DEFAULT_PARAMS_3R2C.copy()
         hb = data.get("hourly_bias")

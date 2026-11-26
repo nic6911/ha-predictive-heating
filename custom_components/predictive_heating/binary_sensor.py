@@ -39,6 +39,11 @@ BINARY_SENSORS: tuple[ZoneBinaryDescription, ...] = (
         translation_key="disturbance_detected",
         value_fn=lambda z: z.disturbance,
     ),
+    ZoneBinaryDescription(
+        key="setpoint_in_sync",
+        translation_key="setpoint_in_sync",
+        value_fn=lambda z: z.setpoint_in_sync,
+    ),
 )
 
 

@@ -30,6 +30,7 @@ from .const import (
     CONF_STEP_MINUTES,
     CONF_TEMP_SENSOR,
     CONF_UPDATE_INTERVAL,
+    CONF_VENTILATION_SENSOR,
     CONF_WEATHER_ENTITY,
     CONF_ZONE_ENABLED,
     CONF_ZONE_ID,
@@ -84,6 +85,16 @@ def _global_schema(defaults: dict[str, Any]) -> vol.Schema:
             ),
             _opt(
                 CONF_CO2_ENTITY, defaults.get(CONF_CO2_ENTITY)
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor")
+            ),
+            _opt(
+                CONF_OUTDOOR_SENSOR, defaults.get(CONF_OUTDOOR_SENSOR)
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor")
+            ),
+            _opt(
+                CONF_VENTILATION_SENSOR, defaults.get(CONF_VENTILATION_SENSOR)
             ): selector.EntitySelector(
                 selector.EntitySelectorConfig(domain="sensor")
             ),

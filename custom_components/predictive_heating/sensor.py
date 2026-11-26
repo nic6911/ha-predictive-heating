@@ -37,6 +37,11 @@ SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda z: z.recommended_setpoint,
+        attr_fn=lambda z: {
+            "applied_setpoint": z.applied_setpoint,
+            "setpoint_in_sync": z.setpoint_in_sync,
+            "override_remaining_min": z.override_remaining_min,
+        },
     ),
     ZoneSensorDescription(
         key="predicted_temperature",
@@ -64,6 +69,7 @@ SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z: z.fit_rmse,
+        attr_fn=lambda z: {"k_vent": z.k_vent},
     ),
     ZoneSensorDescription(
         key="prediction_error",

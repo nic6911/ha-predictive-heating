@@ -18,6 +18,7 @@ from .const import (
     BUFFER_DAYS,
     CO2_BASELINE,
     CO2_SCALE,
+    COAST_HYSTERESIS,
     CONF_CLIMATE_ENTITY,
     CONF_CO2_ENTITY,
     CONF_CO2_OPTIMIZE,
@@ -33,6 +34,7 @@ from .const import (
     CONF_STEP_MINUTES,
     CONF_TEMP_SENSOR,
     CONF_UPDATE_INTERVAL,
+    CONF_VENTILATION_SENSOR,
     CONF_WEATHER_ENTITY,
     CONF_ZONE_ENABLED,
     CONF_ZONE_ID,
@@ -56,6 +58,7 @@ from .const import (
     MODE_WEIGHTS,
     OUTLIER_ABS_CAP,
     REFIT_INTERVAL_HOURS,
+    SETPOINT_READBACK_TOLERANCE,
     ZONE_MODE_ADVISORY,
 )
 from .control import mpc
@@ -73,6 +76,42 @@ from .storage import ModelStore
 _LOGGER = logging.getLogger(__name__)
 
 SAVE_EVERY = 8
+
+
+def recommended_setpoint(
+    indoor: float,
+    comfort_min: float,
+    comfort_target: float,
+    comfort_max: float,
+    u0: float,
+    coasting: bool,
+) -> float:
+    """Setpoint to write this cycle.
+
+    While coasting the heating is fully off (``comfort_min``). Otherwise track
+    the target: never hold above the current temperature (let free gains cool
+    the room) and add the MPC's near-term heat demand when heating is needed.
+    """
+    if coasting:
+        return comfort_min
+    base = min(indoor, comfort_target)
+    return max(comfort_min, min(comfort_max, base + u0))
+
+
+def update_coasting(coasting: bool, free_float, comfort_max: float) -> bool:
+    """Latch the coasting state with asymmetric thresholds.
+
+    Enter only when the whole free-float horizon stays ``COAST_HYSTERESIS`` above
+    the comfort maximum; leave only when it drops ``COAST_HYSTERESIS`` below it.
+    This stops the recommendation churning between ``comfort_min`` and the
+    target every cycle, which also caused needless writes and overrides.
+    """
+    values = np.asarray(free_float, dtype=float)
+    if len(values) == 0:
+        return False
+    if coasting:
+        return bool(float(np.min(values)) >= comfort_max - COAST_HYSTERESIS)
+    return bool(np.all(values >= comfort_max + COAST_HYSTERESIS))
 
 
 @dataclass
@@ -94,6 +133,10 @@ class ZoneResult:
     estimated_savings: float | None = None
     disturbance: bool = False
     prediction_error: float | None = None
+    applied_setpoint: float | None = None
+    override_remaining_min: float | None = None
+    setpoint_in_sync: bool | None = None
+    k_vent: float | None = None
     forecast: list[dict] = field(default_factory=list)
     horizon_hours: float | None = None
     step_minutes: int | None = None
@@ -112,6 +155,7 @@ class _ZoneCore:
     hold_setpoint: float | None = None
     model: RCModel3R2C | None = None
     buffer: list = field(default_factory=list)
+    coasting: bool = False
     hourly_bias: np.ndarray = field(default_factory=lambda: np.zeros(24))
     tw: float = 0.0
     last_buffer_obs: dict | None = None
@@ -246,7 +290,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 wstate.attributes.get("cloud_coverage"),
                 wstate.attributes.get("uv_index"),
             )
-        outdoor_sensor = cfg.get(CONF_OUTDOOR_SENSOR)
+        outdoor_sensor = cfg.get(CONF_OUTDOOR_SENSOR) or self._global(
+            CONF_OUTDOOR_SENSOR
+        )
         if outdoor_sensor:
             ostate = self.hass.states.get(outdoor_sensor)
             if ostate is not None:
@@ -263,6 +309,19 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 except (TypeError, ValueError):
                     pass
         return t_out, sol
+
+    def _read_optional_temp(self, entity_id: str | None) -> float | None:
+        """Read a plausible temperature from an optional sensor, else None."""
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        return value if -50.0 < value < 60.0 else None
 
     @property
     def active_mode(self) -> str:
@@ -289,8 +348,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
         co2_entity = self._global(CONF_CO2_ENTITY)
         co2_enabled = self._global(CONF_CO2_OPTIMIZE, False)
         if weather:
+            anchor = self._read_optional_temp(self._global(CONF_OUTDOOR_SENSOR))
             t_out_fc, sol_fc = await async_get_weather_forecast(
-                self.hass, weather, n, step_min
+                self.hass, weather, n, step_min, anchor_temp=anchor
             )
         price_fc = await async_get_price_forecast(
             self.hass, price_entity, n, step_min
@@ -345,6 +405,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             indoor = None
         current_setpoint = climate_io.read_setpoint(self.hass, climate_entity)
         t_out_now, sol_now = self._current_outdoor_solar(cfg)
+        vent_now = self._read_optional_temp(self._global(CONF_VENTILATION_SENSOR))
         now = dt_util.utcnow()
 
         result = ZoneResult(
@@ -363,7 +424,8 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             # Predicted temperature change from the batch model (or default if cold start).
             if core.model is not None:
                 predicted_delta = core.model.predict_delta(
-                    prev["indoor"], prev["t_out"], prev["sol"], prev["u"], core.tw,
+                    prev["indoor"], prev["t_out"], prev["sol"], prev["u"],
+                    core.tw, prev.get("vent"),
                 )
             else:
                 predicted_delta = 0.0
@@ -401,12 +463,16 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             elif elapsed_ok:
                 hour = lb["time"].hour
                 core.buffer.append(
-                    [lb["indoor"], lb["t_out"], lb["sol"], lb["u"], indoor, hour]
+                    [
+                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"], indoor,
+                        hour, lb.get("vent"),
+                    ]
                 )
                 # Online per-hour bias update.
                 if core.model is not None:
                     phi_lb = core.model.regressor(
-                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"], tw=core.tw,
+                        lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
+                        tw=core.tw, vent=lb.get("vent"),
                     )
                     r = (indoor - lb["indoor"]) - float(phi_lb @ core.model.params)
                     if abs(r) <= OUTLIER_ABS_CAP and 0 <= hour < 24:
@@ -419,7 +485,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                     core.model.tw = core.tw
                     core.model.step(
                         lb["indoor"], lb["t_out"], lb["sol"], lb["u"],
-                        hour=hour,
+                        hour=hour, vent=lb.get("vent"),
                     )
                     core.tw = core.model.tw
                 core.last_buffer_obs = None
@@ -429,6 +495,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                     "t_out": t_out_now,
                     "sol": sol_now,
                     "u": RCModel3R2C.heat_demand(current_setpoint, indoor),
+                    "vent": vent_now,
                     "time": now,
                 }
 
@@ -457,6 +524,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 "t_out": t_out_now,
                 "sol": sol_now,
                 "u": RCModel3R2C.heat_demand(current_setpoint, indoor),
+                "vent": vent_now,
             }
 
         # Forecast/control from the batch model + online hourly bias.
@@ -470,6 +538,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
                 step_minutes=step_min, model_type="auto",
             )
         result.fit_rmse = model.rmse
+        result.k_vent = model.k_vent
 
         if indoor is None or len(t_out_fc) == 0:
             return result
@@ -486,6 +555,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
 
         first_step = now + timedelta(minutes=step_min)
         start_hour = first_step.hour
+        vent_fc = (
+            None if vent_now is None else np.full(len(t_out_fc), vent_now, dtype=float)
+        )
 
         plan = mpc.solve(
             model=model,
@@ -499,23 +571,36 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             w_comfort=w_comfort,
             w_energy=w_energy,
             start_hour=start_hour,
+            vent=vent_fc,
         )
 
         free_float = np.asarray(plan.free_float, dtype=float)
-        summer_no_authority = len(free_float) > 0 and bool(
-            np.all(free_float >= comfort_max)
-        )
-        has_authority = plan.has_authority and not summer_no_authority
+        core.coasting = update_coasting(core.coasting, free_float, comfort_max)
+        has_authority = not core.coasting
 
-        recommended = indoor + plan.u0
-        recommended = max(comfort_min, min(comfort_max, recommended))
-        if not has_authority:
-            recommended = comfort_min
+        recommended = recommended_setpoint(
+            indoor,
+            comfort_min,
+            comfort_target,
+            comfort_max,
+            plan.u0,
+            core.coasting,
+        )
 
         if disturbance and core.hold_setpoint is not None:
             recommended = core.hold_setpoint
 
         result.recommended_setpoint = climate_io.quantise(recommended, core.runtime)
+        result.applied_setpoint = current_setpoint
+        tolerance = max(
+            SETPOINT_READBACK_TOLERANCE,
+            core.runtime.effective_step or core.runtime.step or 0.1,
+        )
+        result.setpoint_in_sync = (
+            current_setpoint is not None
+            and result.recommended_setpoint is not None
+            and abs(current_setpoint - result.recommended_setpoint) <= tolerance
+        )
         result.predicted_temperature = (
             float(plan.temperature[0]) if len(plan.temperature) else None
         )
@@ -545,6 +630,9 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             self.hass, climate_entity, core.runtime
         )
         result.manual_override = manual
+        if core.runtime.override_until is not None:
+            remaining = (core.runtime.override_until - dt_util.now()).total_seconds() / 60.0
+            result.override_remaining_min = max(0.0, round(remaining, 1))
         zone_mode = cfg.get(CONF_ZONE_MODE)
         fit_ok = model.rmse is not None and model.rmse <= FIT_RMSE_AUTONOMY_THRESHOLD
         advisory = (
@@ -591,6 +679,7 @@ class PredictiveHeatingCoordinator(DataUpdateCoordinator):
             core.hold_setpoint = None
             core.model = None
             core.buffer = []
+            core.coasting = False
             core.hourly_bias = np.zeros(24)
             core.tw = 0.0
             self.store.clear_zone(zone_id)

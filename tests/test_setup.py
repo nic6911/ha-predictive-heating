@@ -1,6 +1,8 @@
 """End-to-end setup test: mock a climate + weather entity and verify the
 coordinator sets up, runs a control cycle, and produces a recommendation."""
 
+from datetime import timedelta
+
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from homeassistant.core import HomeAssistant
@@ -10,6 +12,8 @@ from custom_components.predictive_heating.const import (
     CONF_COMFORT_MAX,
     CONF_COMFORT_MIN,
     CONF_COMFORT_TARGET,
+    CONF_OUTDOOR_SENSOR,
+    CONF_VENTILATION_SENSOR,
     CONF_WEATHER_ENTITY,
     CONF_ZONE_ENABLED,
     CONF_ZONE_ID,
@@ -88,6 +92,71 @@ async def test_setup_entry_runs_cycle(
         s for s in hass.states.async_all("sensor") if "predicted" in s.entity_id
     )
     assert pred_sensor.attributes.get("forecast"), "forecast attribute missing"
+
+
+async def test_optional_outdoor_and_ventilation_sensors_are_used(
+    recorder_mock, enable_custom_integrations, hass: HomeAssistant
+):
+    """The optional entities must feed the buffer without being required."""
+    hass.states.async_set(
+        "climate.test_room",
+        "off",
+        {
+            "current_temperature": 20.5,
+            "temperature": 21.0,
+            "min_temp": 5,
+            "max_temp": 30,
+            "target_temp_step": 0.1,
+            "supported_features": 1,
+        },
+    )
+    hass.states.async_set(
+        "weather.home",
+        "cloudy",
+        {"temperature": 2.0, "cloud_coverage": 80, "uv_index": 1},
+    )
+    hass.states.async_set("sensor.outdoor", "7.5", {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.vent", "18.0", {"unit_of_measurement": "°C"})
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_WEATHER_ENTITY: "weather.home",
+            CONF_OUTDOOR_SENSOR: "sensor.outdoor",
+            CONF_VENTILATION_SENSOR: "sensor.vent",
+        },
+        options={
+            CONF_ZONES: [
+                {
+                    CONF_ZONE_ID: "test_room",
+                    CONF_CLIMATE_ENTITY: "climate.test_room",
+                    "name": "Test Room",
+                    CONF_COMFORT_MIN: 19.0,
+                    CONF_COMFORT_TARGET: 21.0,
+                    CONF_COMFORT_MAX: 23.0,
+                    CONF_ZONE_ENABLED: True,
+                }
+            ]
+        },
+    )
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
+    core = coordinator._zones["test_room"]
+    assert coordinator.data["test_room"].k_vent == 0.0
+
+    assert core.last_buffer_obs is not None
+    core.last_buffer_obs["time"] -= timedelta(minutes=40)
+    await coordinator.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert core.buffer, "no buffered transition"
+    last = core.buffer[-1]
+    assert last[1] == 7.5  # global outdoor sensor, not the weather entity
+    assert last[6] == 18.0  # ventilation supply temperature
 
 
 async def test_disabled_zone_still_predicts(

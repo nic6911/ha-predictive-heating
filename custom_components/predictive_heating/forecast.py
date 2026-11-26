@@ -16,6 +16,8 @@ import numpy as np
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from .const import ANCHOR_HOURS
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -61,6 +63,28 @@ def _grid(now: datetime, n: int, step_minutes: float) -> list[datetime]:
     return [now + timedelta(minutes=step_minutes * k) for k in range(n)]
 
 
+def anchor_outdoor(
+    t_out: np.ndarray, anchor_temp: float | None, step_minutes: float
+) -> np.ndarray:
+    """Start a forecast at a measured value, decaying back to its own shape.
+
+    The offset is applied at step 0 and fades linearly to zero over
+    ``ANCHOR_HOURS``. Without an anchor (or for an empty/short array) the
+    forecast is returned unchanged.
+    """
+    values = np.asarray(t_out, dtype=float)
+    if anchor_temp is None or len(values) == 0:
+        return values
+    try:
+        anchor = float(anchor_temp)
+    except (TypeError, ValueError):
+        return values
+    offset = anchor - float(values[0])
+    steps = max(1, int(round(ANCHOR_HOURS * 60.0 / step_minutes)))
+    decay = np.clip(1.0 - np.arange(len(values)) / steps, 0.0, 1.0)
+    return values + offset * decay
+
+
 def _interp_series(
     times: list[datetime],
     values: list[float],
@@ -84,8 +108,14 @@ async def async_get_weather_forecast(
     weather_entity: str,
     n: int,
     step_minutes: float,
+    anchor_temp: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(t_out, sol)`` arrays of length ``n`` over the horizon."""
+    """Return ``(t_out, sol)`` arrays of length ``n`` over the horizon.
+
+    ``anchor_temp`` (an optional measured outdoor temperature) shifts the
+    forecast so it starts at the measurement and decays back to the forecast
+    shape over ``ANCHOR_HOURS``; without it the forecast is used unchanged.
+    """
     now = dt_util.now()
     grid = _grid(now, n, step_minutes)
     cur = hass.states.get(weather_entity)
@@ -125,7 +155,9 @@ async def async_get_weather_forecast(
             solar_proxy(point.get("cloud_coverage"), point.get("uv_index"))
         )
 
-    t_out = _interp_series(times, temps, grid, fallback_temp)
+    t_out = anchor_outdoor(
+        _interp_series(times, temps, grid, fallback_temp), anchor_temp, step_minutes
+    )
     sol = _interp_series(times, sols, grid, 0.0)
     return t_out, sol
 

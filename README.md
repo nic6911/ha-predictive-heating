@@ -45,14 +45,23 @@ bound to your location). No cloud, no API keys.
   *recommends* until the model has learned enough.
 - Optional **price-aware** scheduling using any price sensor you already have
   (Nord Pool, Energi Data Service, Tibber, …).
+- Optional **global inputs** in the main settings: a measured **outdoor
+  temperature** sensor (used for learning and to anchor the weather forecast at
+  the current reading) and a **ventilation supply/inlet temperature** sensor
+  (e.g. from a Nilan after the heater). The ventilation term is a qualitative
+  disturbance input: the airflow is unknown, so it is only fitted when the
+  data is excited and it improves a held-out fit, and it is never used to
+  compute energy.
 
 ## Entities
 
-Per zone: `sensor.*_recommended_setpoint`, `sensor.*_predicted_temperature`,
-`sensor.*_estimated_setpoint_reduction`, diagnostic `sensor.*_model_fit_rmse`,
+Per zone: `sensor.*_recommended_setpoint` (with `applied_setpoint`,
+`setpoint_in_sync` and `override_remaining_min` attributes),
+`sensor.*_predicted_temperature`, `sensor.*_estimated_setpoint_reduction`,
+diagnostic `sensor.*_model_fit_rmse` (with the learned `k_vent` attribute),
 diagnostic `sensor.*_prediction_error` (actual minus predicted),
 `binary_sensor.*_manual_override`, `binary_sensor.*_coasting_on_free_heat`,
-`binary_sensor.*_disturbance_detected`,
+`binary_sensor.*_disturbance_detected`, `binary_sensor.*_setpoint_in_sync`,
 `switch.*_predictive_control`, `number.*_comfort_minimum/target/maximum`.
 
 The `predicted_temperature` sensor also exposes a `forecast` attribute with the full

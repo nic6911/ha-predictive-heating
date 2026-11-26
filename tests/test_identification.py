@@ -37,12 +37,58 @@ def _make_samples_well_excited(n=500, seed=0):
     return samples
 
 
+def _make_samples_with_vent(n=700, seed=3, k_vent=0.06):
+    """Synthetic data whose true model includes a ventilation disturbance."""
+    rng = np.random.default_rng(seed)
+    model = RCModel3R2C(params=np.array([0.08, 0.20, 0.25, 0.20, 0.08, 0.02, k_vent]))
+    samples = []
+    indoor = 21.5
+    tw = indoor
+    for i in range(n):
+        t_out = rng.uniform(-5, 10)
+        sol = rng.uniform(0, 1)
+        u = rng.uniform(0.0, 3.0)
+        vent = 17.0 + 2.5 * np.sin(i / 27.0) + rng.normal(0, 0.4)
+        delta = (
+            model.ka * (t_out - indoor)
+            + model.k_aw * (tw - indoor)
+            + model.ks * sol + model.kh * u + model.kg
+            + k_vent * (vent - indoor)
+        )
+        nxt = indoor + delta + rng.normal(0, 0.01)
+        tw = tw + model.k_wa * (indoor - tw)
+        samples.append((indoor, t_out, sol, u, nxt, i % 24, vent))
+        indoor = nxt
+        if indoor < 12 or indoor > 30:
+            indoor = 21.5
+            tw = indoor
+    return samples
+
+
+def test_batch_fit_auto_recovers_vent_coefficient():
+    """A varying ventilation input should be identified with the right sign."""
+    fitted = batch_fit_auto(_make_samples_with_vent())
+    assert 0.02 < fitted.k_vent < 0.12
+    assert fitted.rmse is not None and fitted.rmse < 0.15
+
+
+def test_batch_fit_auto_drops_unexcited_vent_input():
+    """A constant ventilation effect must not be fitted (it is not identifiable)."""
+    samples = [
+        (row[0], row[1], row[2], row[3], row[4], 0, row[0] + 4.0)
+        for row in _make_samples_well_excited()
+    ]
+    fitted = batch_fit_auto(samples)
+    assert fitted.k_vent == 0.0
+
+
 def test_batch_fit_auto_recovers_params_well_excited():
     """Well-excited data should recover ka, ks, kh, kg near ground truth."""
     samples = _make_samples_well_excited()
     model = batch_fit_auto(samples)
-    assert model.params.shape == (6,)
+    assert model.params.shape == (7,)
     assert model.model_type == "auto"
+    assert model.k_vent == 0.0
     # ka should be within reasonable range of the true 0.08.
     assert 0.04 < model.params[0] < 0.20
     assert model.rmse is not None and model.rmse < 0.10
@@ -51,7 +97,7 @@ def test_batch_fit_auto_recovers_params_well_excited():
 def test_batch_fit_auto_handles_insufficient_data():
     """With only 1 sample, must return a default model without raising."""
     model = batch_fit_auto([(20.0, 5.0, 0.0, 1.0, 20.1)])
-    assert model.params.shape == (6,)
+    assert model.params.shape == (7,)
     assert model.model_type == "auto"
 
 

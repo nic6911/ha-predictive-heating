@@ -20,10 +20,12 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     MANUAL_OVERRIDE_HOLD,
-    MANUAL_OVERRIDE_TOLERANCE,
     PLAUSIBLE_TEMP_MAX,
     PLAUSIBLE_TEMP_MIN,
+    SETPOINT_COARSE_TOLERANCE,
     SETPOINT_DEADBAND,
+    SETPOINT_READBACK_TOLERANCE,
+    SETPOINT_SETTLE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,10 +51,14 @@ class ZoneRuntime:
 
     zone_id: str
     last_written_setpoint: float | None = None
+    last_written_at: datetime | None = None
+    last_seen_setpoint: float | None = None
     override_until: datetime | None = None
     min_temp: float = 5.0
     max_temp: float = 30.0
     step: float = 0.1
+    # Coarser grid the actuator really uses, learned from read-backs (e.g. 0.5).
+    effective_step: float | None = None
     extra: dict = field(default_factory=dict)
 
 
@@ -96,28 +102,84 @@ def read_limits(hass: HomeAssistant, climate_entity: str, runtime: ZoneRuntime) 
     runtime.step = float(state.attributes.get("target_temp_step", runtime.step))
 
 
-def detect_manual_override(
-    hass: HomeAssistant, climate_entity: str, runtime: ZoneRuntime
-) -> bool:
-    """Return True if the current setpoint differs from what we last wrote.
+def _grid_step(value: float) -> float:
+    """Return the coarsest grid (0.5 or 0.1 deg C) a reported value lies on."""
+    if abs(value * 2.0 - round(value * 2.0)) < 1e-6:
+        return 0.5
+    return 0.1
 
-    Engages a hold window so the user's manual choice is respected for a while.
-    """
-    current = read_setpoint(hass, climate_entity)
-    now = dt_util.now()
-    if (
-        current is not None
-        and runtime.last_written_setpoint is not None
-        and abs(current - runtime.last_written_setpoint) > MANUAL_OVERRIDE_TOLERANCE
-    ):
-        runtime.override_until = now + MANUAL_OVERRIDE_HOLD
+
+def _learn_effective_step(runtime: ZoneRuntime, reported: float) -> None:
+    """Learn that the actuator snaps to a coarser grid than it advertises."""
+    step = _grid_step(reported)
+    if step > (runtime.effective_step or runtime.step):
+        runtime.effective_step = step
+
+
+def _hold_active(runtime: ZoneRuntime, now: datetime) -> bool:
     return runtime.override_until is not None and now < runtime.override_until
 
 
+def detect_manual_override(
+    hass: HomeAssistant, climate_entity: str, runtime: ZoneRuntime
+) -> bool:
+    """Return True while a user's setpoint change should be respected.
+
+    A setpoint within ``SETPOINT_READBACK_TOLERANCE`` of our last write is the
+    device's own rounding (actuators may snap to 0.5 C), so it is adopted as our
+    value and never counts as a manual change. A larger change is treated as the
+    user and arms the hold once; it is not re-armed every cycle, so the hold can
+    expire instead of latching forever.
+    """
+    current = read_setpoint(hass, climate_entity)
+    now = dt_util.now()
+    if current is None:
+        return _hold_active(runtime, now)
+
+    last = runtime.last_written_setpoint
+    if last is not None:
+        delta = abs(current - last)
+        settling = (
+            runtime.last_written_at is not None
+            and now - runtime.last_written_at <= SETPOINT_SETTLE
+        )
+        adopt = delta <= SETPOINT_READBACK_TOLERANCE + 1e-6
+        if (
+            not adopt
+            and runtime.effective_step is None
+            and delta <= SETPOINT_COARSE_TOLERANCE + 1e-6
+            and _grid_step(current) > _grid_step(last)
+        ):
+            # The actuator floored our finer write onto its coarse grid.
+            adopt = True
+        if adopt:
+            # Our own write, possibly quantised by the actuator: adopt it.
+            if delta > 1e-9:
+                _learn_effective_step(runtime, current)
+            runtime.last_written_setpoint = current
+            runtime.override_until = None
+            runtime.last_seen_setpoint = current
+            return False
+        if settling:
+            # Give the device a moment before calling it a user change.
+            return _hold_active(runtime, now)
+
+    if runtime.last_seen_setpoint is None:
+        # First observation after a restart: not a user change.
+        runtime.last_seen_setpoint = current
+        return _hold_active(runtime, now)
+
+    # A change we cannot explain by our own write: arm the hold once per change.
+    if abs(current - runtime.last_seen_setpoint) > 1e-6:
+        runtime.override_until = now + MANUAL_OVERRIDE_HOLD
+    runtime.last_seen_setpoint = current
+    return _hold_active(runtime, now)
+
+
 def quantise(value: float, runtime: ZoneRuntime) -> float:
-    """Clamp to actuator limits and round to the entity's step."""
+    """Clamp to actuator limits and round to the learned (or reported) step."""
     value = max(runtime.min_temp, min(runtime.max_temp, value))
-    step = runtime.step or 0.1
+    step = runtime.effective_step or runtime.step or 0.1
     return round(round(value / step) * step, 3)
 
 
@@ -139,5 +201,18 @@ async def async_write_setpoint(
         blocking=True,
     )
     runtime.last_written_setpoint = target
+    runtime.last_written_at = dt_util.now()
+    runtime.last_seen_setpoint = target
+    # If the actuator already reports a (coarser) quantised value, adopt it.
+    reported = read_setpoint(hass, climate_entity)
+    if reported is not None and abs(reported - target) > 1e-9:
+        delta = abs(reported - target)
+        coarse = runtime.effective_step is None and _grid_step(reported) > _grid_step(target)
+        if delta <= SETPOINT_READBACK_TOLERANCE + 1e-6 or (
+            coarse and delta <= SETPOINT_COARSE_TOLERANCE + 1e-6
+        ):
+            _learn_effective_step(runtime, reported)
+            runtime.last_written_setpoint = reported
+            runtime.last_seen_setpoint = reported
     _LOGGER.debug("Wrote setpoint %.2f to %s", target, climate_entity)
     return True

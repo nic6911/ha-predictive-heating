@@ -68,3 +68,31 @@ def test_internal_gains_float_above_outdoor():
 def test_model_type_default_auto():
     model = RCModel3R2C()
     assert model.model_type == "auto"
+
+
+def test_from_dict_pads_old_six_param_model():
+    """Models stored before the vent term must load with k_vent = 0."""
+    old = {
+        "params": [0.06, 0.15, 0.20, 0.18, 0.06, 0.015],
+        "rmse": 0.2,
+        "n_samples": 10,
+        "step_minutes": 30.0,
+    }
+    model = RCModel3R2C.from_dict(old)
+    assert model.params.shape == (7,)
+    assert model.k_vent == 0.0
+    assert np.allclose(model.params[:6], old["params"])
+
+
+def test_vent_term_changes_prediction():
+    model = RCModel3R2C(params=np.array([0.08, 0.0, 0.25, 0.20, 0.08, 0.02, 0.05]))
+    without = model.predict_delta(22.0, 5.0, 0.0, 1.0, tw=22.0)
+    with_vent = model.predict_delta(22.0, 5.0, 0.0, 1.0, tw=22.0, vent=18.0)
+    assert np.isclose(with_vent - without, 0.05 * (18.0 - 22.0))
+
+
+def test_vent_term_absent_without_input():
+    model = RCModel3R2C(params=np.array([0.08, 0.0, 0.25, 0.20, 0.08, 0.02, 0.05]))
+    without = model.predict_delta(22.0, 5.0, 0.0, 1.0, tw=22.0)
+    zero_vent = model.predict_delta(22.0, 5.0, 0.0, 1.0, tw=22.0, vent=22.0)
+    assert np.isclose(without, zero_vent)

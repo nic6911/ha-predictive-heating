@@ -19,6 +19,7 @@ from .const import (
     CONF_OUTDOOR_SENSOR,
     CONF_STEP_MINUTES,
     CONF_TEMP_SENSOR,
+    CONF_VENTILATION_SENSOR,
     CONF_WEATHER_ENTITY,
     CONF_ZONE_ID,
     DEFAULT_STEP_MINUTES,
@@ -84,7 +85,10 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
 
     climate_entity = cfg[CONF_CLIMATE_ENTITY]
     temp_sensor = cfg.get(CONF_TEMP_SENSOR)
-    outdoor_sensor = cfg.get(CONF_OUTDOOR_SENSOR)
+    outdoor_sensor = cfg.get(CONF_OUTDOOR_SENSOR) or coordinator._global(
+        CONF_OUTDOOR_SENSOR
+    )
+    vent_sensor = coordinator._global(CONF_VENTILATION_SENSOR)
     step_min = coordinator._global(CONF_STEP_MINUTES, DEFAULT_STEP_MINUTES)
     weather_entity = (
         None if outdoor_sensor else coordinator._global(CONF_WEATHER_ENTITY)
@@ -99,6 +103,8 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         entity_ids.append(outdoor_sensor)
     elif weather_entity:
         entity_ids.append(weather_entity)
+    if vent_sensor:
+        entity_ids.append(vent_sensor)
 
     raw = await get_instance(hass).async_add_executor_job(
         history.get_significant_states,
@@ -110,7 +116,7 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         True,
     )
 
-    indoor_pairs, setpoint_pairs, outdoor_pairs = [], [], []
+    indoor_pairs, setpoint_pairs, outdoor_pairs, vent_pairs = [], [], [], []
     for state in raw.get(climate_entity, []):
         ts = state.last_changed
         try:
@@ -147,6 +153,13 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
                     outdoor_pairs.append((state.last_changed, float(temp)))
             except (TypeError, ValueError):
                 continue
+    if vent_sensor:
+        for state in raw.get(vent_sensor, []):
+            try:
+                if _plausible(float(state.state)):
+                    vent_pairs.append((state.last_changed, float(state.state)))
+            except (TypeError, ValueError):
+                continue
 
     if len(indoor_pairs) < 10:
         _LOGGER.warning(
@@ -159,6 +172,7 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
     indoor = _resample(indoor_pairs, grid)
     setpoint = _resample(setpoint_pairs, grid)
     outdoor = _resample(outdoor_pairs, grid) if outdoor_pairs else [None] * n
+    vent = _resample(vent_pairs, grid) if vent_pairs else [None] * n
     first_outdoor = next((v for v in outdoor if v is not None), None)
     if first_outdoor is not None:
         for k in range(n):
@@ -182,7 +196,7 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         u = RCModel3R2C.heat_demand(setpoint[k], indoor[k])
         sol = clear_sky_index(grid[k], lat, lon)
         hour = grid[k].hour
-        samples.append((indoor[k], t_out, sol, u, indoor[k + 1], hour))
+        samples.append((indoor[k], t_out, sol, u, indoor[k + 1], hour, vent[k]))
 
     model = batch_fit_auto(samples, step_minutes=step_min)
     zone_id = cfg[CONF_ZONE_ID]
@@ -195,6 +209,7 @@ async def _bootstrap_zone(hass: HomeAssistant, coordinator, cfg: dict, days: int
         core.hold_setpoint = None
         core.model = model
         core.buffer = [list(s) for s in samples]
+        core.coasting = False
         core.hourly_bias = model.hourly_bias.copy()
         if hasattr(model, 'tw'):
             core.tw = model.tw

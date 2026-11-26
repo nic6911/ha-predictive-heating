@@ -2,14 +2,26 @@
 
 The single entry point is :func:`batch_fit_auto`, which adaptively identifies
 a two-node model using data-informed priors and excitation-aware column
-selection.
+selection. An optional ventilation supply temperature (sample field 7) adds a
+``k_vent * (T_vent - T_indoor)`` disturbance term; it is only kept when the data
+is excited and the term improves a held-out tail of the window.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from ..const import N_HOURS, N_PARAMS_3R2C
+from ..const import (
+    N_HOURS,
+    N_PARAMS_3R2C,
+    VENT_EXCITATION_STD,
+    VENT_HOLDOUT_FRACTION,
+    VENT_HOLDOUT_IMPROVEMENT,
+    VENT_LOWER,
+    VENT_MIN_SAMPLES,
+    VENT_PRIOR,
+    VENT_UPPER,
+)
 from .rc_model_3r2c import RCModel3R2C
 
 # Below this standard deviation of the heating proxy ``u`` (deg C) we consider the
@@ -24,6 +36,10 @@ EXCITATION_SOL_STD = 0.05
 
 # Huber threshold (deg C) for robust IRLS residual weighting.
 HUBER_DELTA = 0.4
+
+# Phi columns 0..5 map onto parameter indices 0..4 and 6 (k_wa is derived, not
+# fitted, so column 5 is the ventilation term and parameter 5 is skipped).
+COL_TO_PARAM = (0, 1, 2, 3, 4, 6)
 
 
 def _weighted_ridge(
@@ -44,13 +60,32 @@ def _weighted_ridge(
 # ---------------------------------------------------------------------------
 # 3R2C (two-node) identification
 # ---------------------------------------------------------------------------
-# Bounds for the 6-parameter 3R2C model.
-PARAM_LOWER_3R2C = np.array([0.005, 0.0, 0.0, -2.0, 0.001, 0.001], dtype=float)
-PARAM_UPPER_3R2C = np.array([0.50, 2.0, 1.0, 4.0, 0.50, 0.50], dtype=float)
+# Bounds for the 7-parameter 3R2C model.
+PARAM_LOWER_3R2C = np.array([0.005, 0.0, 0.0, -2.0, 0.001, 0.001, VENT_LOWER], dtype=float)
+PARAM_UPPER_3R2C = np.array([0.50, 2.0, 1.0, 4.0, 0.50, 0.50, VENT_UPPER], dtype=float)
 
 # Default wall-to-air heat-capacity ratio (C_w / C_a).  k_wa = k_aw / C_RATIO.
 # Heavier slabs -> larger ratio; 4.0 is reasonable for a concrete floor.
 C_RATIO_3R2C = 4.0
+
+
+def vent_effects(samples: list[tuple]) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """Return ``(T_vent - T_indoor, valid_mask)`` for samples with a vent value."""
+    effects = np.zeros(len(samples), dtype=float)
+    valid = np.zeros(len(samples), dtype=bool)
+    for index, sample in enumerate(samples):
+        if len(sample) <= 6 or sample[6] is None:
+            continue
+        try:
+            value = float(sample[6])
+        except (TypeError, ValueError):
+            continue
+        if -50.0 < value < 60.0:
+            effects[index] = value - float(sample[0])
+            valid[index] = True
+    if not valid.any():
+        return None, None
+    return effects, valid
 
 
 def _forward_filter_tw(
@@ -150,8 +185,11 @@ def batch_fit_auto(
     * **Moderate** (indoor range < 1.5 °C or coupling ratio < 0.25):
       ``ka`` and ``kg`` are fitted with data-informed priors.  Wall params
       (k_aw, k_wa) are held at priors derived from ka.
-    * **Well-excited** (otherwise): Full 6-param fit with excitation guards
+    * **Well-excited** (otherwise): Full fit with excitation guards
       for ks, kh.
+
+    The optional ventilation term is added when the buffer carries it, has
+    enough variation, and improves a held-out tail of the window.
 
     Returns an :class:`RCModel3R2C` with ``model_type="auto"``.
     """
@@ -186,8 +224,19 @@ def batch_fit_auto(
         kg_eff,              # kg: steady-state offset
         ka_eff * 3.0,        # k_aw: wall coupling proportional to ka
         ka_eff * 0.75,       # k_wa: k_aw / C_ratio
+        VENT_PRIOR,          # k_vent: no effect unless identified
     ], dtype=float)
     adaptive_prior = np.clip(adaptive_prior, PARAM_LOWER_3R2C, PARAM_UPPER_3R2C)
+
+    # Optional ventilation regressor.
+    vent_effect, vent_valid = vent_effects(samples)
+    vent_available = False
+    if vent_effect is not None and vent_valid is not None:
+        valid_effect = vent_effect[vent_valid]
+        vent_available = (
+            len(valid_effect) >= VENT_MIN_SAMPLES
+            and float(np.std(valid_effect)) >= VENT_EXCITATION_STD
+        )
 
     # Determine excitation regime and select columns to fit.
     is_stable = (
@@ -213,33 +262,37 @@ def batch_fit_auto(
             fit_cols.append(1)
         if float(np.std(u)) >= EXCITATION_U_STD:
             fit_cols.append(2)
-        else:
-            y = y - adaptive_prior[2] * u
         ridge_actual = ridge
         n_iterations = 3
+    if vent_available:
+        fit_cols.append(5)
+    fit_cols = sorted(set(fit_cols))
 
-    fit_cols = sorted(fit_cols)
     theta = adaptive_prior.copy()
 
     # ---- Iterative two-step identification ----
     tw = _forward_filter_tw(samples, k_wa=theta[5])
 
     for iteration in range(n_iterations):
-        phi = np.zeros((len(samples), 5), dtype=float)
+        phi = np.zeros((len(samples), 6), dtype=float)
         phi[:, 0] = t_out - indoor
         phi[:, 1] = sol
         phi[:, 2] = u
         phi[:, 3] = 1.0
         phi[:, 4] = tw[:len(samples)] - indoor
+        if vent_available and vent_effect is not None:
+            phi[:, 5] = vent_effect
 
-        # Adjust target for params NOT being fitted.
+        # Adjust target for params NOT being fitted (each column maps to a param).
         y_adj = y.copy()
-        for c in range(5):
-            if c not in fit_cols and c < len(adaptive_prior):
-                y_adj -= adaptive_prior[c] * phi[:, c]
+        for col in range(phi.shape[1]):
+            if col not in fit_cols:
+                y_adj -= adaptive_prior[COL_TO_PARAM[col]] * phi[:, col]
 
         phi_sub = phi[:, fit_cols]
-        prior_sub = adaptive_prior[fit_cols].copy()
+        prior_sub = np.array(
+            [adaptive_prior[COL_TO_PARAM[col]] for col in fit_cols], dtype=float
+        )
 
         w = np.ones(len(y_adj), dtype=float)
         theta_sub = prior_sub.copy()
@@ -251,8 +304,8 @@ def batch_fit_auto(
             a = np.abs(resid)
             w = np.where(a <= delta, 1.0, delta / np.maximum(a, 1e-9))
 
-        for i, c in enumerate(fit_cols):
-            theta[c] = theta_sub[i]
+        for i, col in enumerate(fit_cols):
+            theta[COL_TO_PARAM[col]] = theta_sub[i]
 
         theta[5] = float(np.clip(theta[4] / C_RATIO_3R2C, 0.001, 0.50))
 
@@ -263,14 +316,30 @@ def batch_fit_auto(
     tw_final = _forward_filter_tw(samples, k_wa=theta[5])
     tw_last = float(tw_final[-1])
 
-    # Residuals on the full 5-col regressor.
-    phi_final = np.zeros((len(samples), 5), dtype=float)
+    phi_final = np.zeros((len(samples), 6), dtype=float)
     phi_final[:, 0] = t_out - indoor
     phi_final[:, 1] = sol
     phi_final[:, 2] = u
     phi_final[:, 3] = 1.0
     phi_final[:, 4] = tw_final[:len(samples)] - indoor
-    resids = y - (phi_final @ theta[:5])
+    if vent_available and vent_effect is not None:
+        phi_final[:, 5] = vent_effect
+
+    # Hold-out check: keep the ventilation term only if it helps out of sample.
+    if vent_available and theta[6] != 0.0:
+        holdout = int(len(samples) * VENT_HOLDOUT_FRACTION)
+        if holdout >= 24:
+            sl = slice(len(samples) - holdout, None)
+            theta_cols = theta[list(COL_TO_PARAM)]
+            with_vent = y[sl] - phi_final[sl] @ theta_cols
+            without_vent = with_vent + theta[6] * phi_final[sl, 5]
+            rmse_with = float(np.sqrt(np.mean(with_vent ** 2)))
+            rmse_without = float(np.sqrt(np.mean(without_vent ** 2)))
+            if rmse_with > rmse_without * (1.0 - VENT_HOLDOUT_IMPROVEMENT):
+                theta[6] = 0.0
+
+    theta_cols = theta[list(COL_TO_PARAM)]
+    resids = y - phi_final @ theta_cols
     rmse = float(np.sqrt(np.mean(resids ** 2))) if len(resids) else None
 
     # Hourly bias from per-hour median residuals.

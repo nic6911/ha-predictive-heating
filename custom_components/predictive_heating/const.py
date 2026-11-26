@@ -34,6 +34,8 @@ CONF_COMFORT_MAX = "comfort_max"
 CONF_COMFORT_TARGET = "comfort_target"
 CONF_ZONE_MODE = "zone_mode"
 CONF_ZONE_ENABLED = "enabled"
+# Optional global inputs (house-level, not per zone).
+CONF_VENTILATION_SENSOR = "ventilation_sensor"
 
 # Modes (global optimization profile)
 MODE_COMFORT = "comfort"
@@ -72,8 +74,20 @@ MAX_SAMPLE_JUMP = 5.0
 
 # Control behaviour
 SETPOINT_DEADBAND = 0.2  # deg C; only write if change exceeds this
-MANUAL_OVERRIDE_TOLERANCE = 0.05  # deg C tolerance for detecting external setpoint change
+# Actuators may quantise a written setpoint more coarsely than their reported
+# ``target_temp_step`` (the Wavin Sentio advertises 0.1 C but floors to 0.5 C).
+# Before the coarse grid is learned, a write that lands on a coarser grid is
+# still ours: the flooring error can be just under half a coarse step.
+SETPOINT_COARSE_TOLERANCE = 0.55  # deg C
+# Once the grid is learned our writes are exact, so only a real change is larger.
+SETPOINT_READBACK_TOLERANCE = 0.1  # deg C
+# A mismatch right after a write is treated as the device settling, not a user.
+SETPOINT_SETTLE = timedelta(minutes=5)
 MANUAL_OVERRIDE_HOLD = timedelta(hours=2)  # back off autonomous control after manual change
+# Coasting: only drop the recommendation to comfort_min when the whole free-float
+# horizon stays this far above the comfort maximum. Prevents churn between
+# comfort_min and the target when the authority decision wobbles.
+COAST_HYSTERESIS = 0.3  # deg C
 
 # Objective weights per mode: (w_comfort, w_energy)
 MODE_WEIGHTS = {
@@ -135,7 +149,25 @@ DISTURBANCE_DROP_MIN = 0.5  # deg C; minimum drop-below-prediction to flag
 DISTURBANCE_HOLD = timedelta(minutes=60)
 
 # Number of parameters in the 3R2C two-node model.
-N_PARAMS_3R2C = 6  # [ka, ks, kh, kg, k_aw, k_wa]
+# [ka, ks, kh, kg, k_aw, k_wa, k_vent]
+N_PARAMS_3R2C = 7
+
+# Optional ventilation input (supply/inlet air, e.g. after a Nilan heater).
+# Airflow is unknown, so k_vent is an empirical disturbance gain, never an
+# energy measurement; it is fitted only when the sensor is configured and the
+# data is excited enough, and it is dropped when it does not improve a held-out
+# tail of the training window.
+VENT_EXCITATION_STD = 0.3  # deg C; std(T_vent - T_indoor) needed to fit it
+VENT_MIN_SAMPLES = 48
+VENT_PRIOR = 0.0
+VENT_LOWER = -0.15
+VENT_UPPER = 0.15
+VENT_HOLDOUT_FRACTION = 0.2
+VENT_HOLDOUT_IMPROVEMENT = 0.01  # relative RMSE gain required to keep the term
+
+# Optional global outdoor sensor: how long the measured value anchors the weather
+# forecast at t=0 before the forecast shape takes over again.
+ANCHOR_HOURS = 3.0
 
 # Hourly bias (time-varying internal gains schedule).
 # Number of hours in a day for the per-hour bias array.
